@@ -10,9 +10,19 @@
 HEARTBEAT_DIR="$HOME/.aqua-remote/heartbeats"
 STATE_DIR="$HOME/.aqua-remote/state"
 LOG_DIR="$HOME/.aqua-remote/logs"
+PID_DIR="$HOME/.aqua-remote/pids"
 LOCKFILE="/tmp/aqua-remote-watchdog.lock"
 MAX_AGE=300  # 5 min
 AQUA_REMOTE_SRC=""  # Set during install
+
+# OS detection for stat command compatibility
+get_file_mtime() {
+    if [[ "$(uname)" == "Darwin" ]]; then
+        stat -f %m "$1" 2>/dev/null || echo 0
+    else
+        stat -c %Y "$1" 2>/dev/null || echo 0
+    fi
+}
 
 # Find aqua-remote source
 for p in "$HOME/aqua-remote/src" "$HOME/.aqua-remote/src" "$(dirname "$0")/../src"; do
@@ -27,11 +37,11 @@ if [ -z "$AQUA_REMOTE_SRC" ]; then
     exit 1
 fi
 
-mkdir -p "$HEARTBEAT_DIR" "$STATE_DIR" "$LOG_DIR"
+mkdir -p "$HEARTBEAT_DIR" "$STATE_DIR" "$LOG_DIR" "$PID_DIR"
 
 # Prevent concurrent runs
 if [ -f "$LOCKFILE" ]; then
-    LOCK_AGE=$(( $(date +%s) - $(stat -c %Y "$LOCKFILE" 2>/dev/null || echo 0) ))
+    LOCK_AGE=$(( $(date +%s) - $(get_file_mtime "$LOCKFILE") ))
     if [ "$LOCK_AGE" -lt 120 ]; then
         exit 0
     fi
@@ -52,11 +62,13 @@ for hb_file in "$HEARTBEAT_DIR"/*; do
     if [ "$AGE" -gt "$MAX_AGE" ]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] STALE heartbeat for $SESSION_NAME (${AGE}s old)" >> "$LOG_DIR/watchdog.log"
 
-        # Read session target from state
-        TARGET=$(python3 -c "
-import json, sys
+        # Read session target from state (pass paths via env to avoid injection)
+        TARGET=$(AQUA_STATE_DIR="$STATE_DIR" AQUA_SESSION="$SESSION_NAME" python3 -c "
+import json, os
 try:
-    s = json.load(open('$STATE_DIR/${SESSION_NAME}.json'))
+    state_dir = os.environ['AQUA_STATE_DIR']
+    session = os.environ['AQUA_SESSION']
+    s = json.load(open(os.path.join(state_dir, session + '.json')))
     print(s.get('tmux_target', ''))
 except: pass
 " 2>/dev/null)
@@ -77,15 +89,21 @@ except: pass
 
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Restarted $SESSION_NAME (target=$TARGET, PID=$NEW_PID)" >> "$LOG_DIR/watchdog.log"
 
-        # Alert via Python notify
+        # Alert via Python notify (pass values via env to avoid shell injection)
+        AQUA_SESSION="$SESSION_NAME" AQUA_TARGET="$TARGET" AQUA_AGE="$AGE" AQUA_PID="$NEW_PID" \
         python3 -c "
+import os
 from notify import create_channel
 ch = create_channel()
+name = os.environ['AQUA_SESSION']
+target = os.environ['AQUA_TARGET']
+age = os.environ['AQUA_AGE']
+pid = os.environ['AQUA_PID']
 ch.send(
-    'aqua-remote: $SESSION_NAME — MONITOR RESTARTED',
-    'Monitor for <code>$TARGET</code> was dead (heartbeat ${AGE}s old).\n'
-    'Auto-restarted as PID $NEW_PID.\n\n'
-    'Check if RC link still works.',
+    f'aqua-remote: {name} — MONITOR RESTARTED',
+    f'Monitor for <code>{target}</code> was dead (heartbeat {age}s old).\n'
+    f'Auto-restarted as PID {pid}.\n\n'
+    f'Check if RC link still works.',
 )
 " 2>/dev/null
 

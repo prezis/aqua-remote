@@ -185,7 +185,12 @@ def setup_email() -> dict:
     print("  3. Create an App Password for 'Mail'")
     print()
     smtp_host = input("SMTP host [smtp.gmail.com]: ").strip() or "smtp.gmail.com"
-    smtp_port = int(input("SMTP port [587]: ").strip() or "587")
+    smtp_port_str = input("SMTP port [587]: ").strip() or "587"
+    try:
+        smtp_port = int(smtp_port_str)
+    except ValueError:
+        print(f"Invalid port '{smtp_port_str}', using default 587.")
+        smtp_port = 587
     username = input("SMTP username (email): ").strip()
     password = input("SMTP password (app password): ").strip()
     from_addr = input(f"From address [{username}]: ").strip() or username
@@ -269,6 +274,9 @@ def run_setup():
     save_config(cfg)
     print(f"\nConfig saved to {CONFIG_FILE}")
     print(f"  Channel: {cfg.get('channel')}")
+    print()
+    print("  NOTE: Config is stored in plaintext with chmod 600 (owner-only read).")
+    print("  Do not commit config.json to version control — it contains credentials.")
 
     # Step 5: Show next steps
     windows = list_tmux_windows()
@@ -280,10 +288,7 @@ def run_setup():
             print(f"  {w}")
         print()
     print("To start monitoring a session:")
-    print("  aqua-remote start --session sol:0 --name pilot")
-    print()
-    print("Or use the Claude Code skill:")
-    print("  /aqua-remote")
+    print("  python3 src/cli.py start --session sol:0 --name pilot")
     print()
 
 

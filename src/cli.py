@@ -28,8 +28,8 @@ sys.path.insert(0, str(SRC_DIR))
 
 from notify import create_channel, load_config, CONFIG_FILE
 from monitor import (
-    check_heartbeat, HEARTBEAT_DIR, STATE_DIR, LOG_DIR,
-    _ensure_dirs,
+    check_heartbeat, HEARTBEAT_DIR, STATE_DIR, LOG_DIR, PID_DIR,
+    _ensure_dirs, read_pid_file,
 )
 
 
@@ -61,22 +61,36 @@ def cmd_start(args):
         subprocess.run(["tmux", "ls"])
         sys.exit(1)
 
-    # Check if already running
-    result = subprocess.run(
-        ["pgrep", "-f", f"monitor.py.*--name.*{name}"],
-        capture_output=True, text=True,
-    )
-    if result.stdout.strip():
-        pids = result.stdout.strip().split("\n")
-        print(f"Monitor for '{name}' already running (PID: {', '.join(pids)})")
+    # Check if already running (PID file first, pgrep fallback)
+    existing_pid = read_pid_file(name)
+    if existing_pid:
+        print(f"Monitor for '{name}' already running (PID: {existing_pid})")
         if not args.force:
             print("Use --force to restart.")
             sys.exit(1)
         # Kill existing
-        for pid in pids:
-            os.kill(int(pid.strip()), signal.SIGTERM)
+        os.kill(existing_pid, signal.SIGTERM)
         import time
         time.sleep(2)
+    else:
+        # Fallback: pgrep for processes without PID file
+        result = subprocess.run(
+            ["pgrep", "-f", f"monitor.py.*--name.*{name}"],
+            capture_output=True, text=True,
+        )
+        if result.stdout.strip():
+            pids = result.stdout.strip().split("\n")
+            print(f"Monitor for '{name}' already running (PID: {', '.join(pids)})")
+            if not args.force:
+                print("Use --force to restart.")
+                sys.exit(1)
+            for pid in pids:
+                try:
+                    os.kill(int(pid.strip()), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            import time
+            time.sleep(2)
 
     # Save tmux_target in state for watchdog
     state_file = STATE_DIR / f"{name}.json"
@@ -101,13 +115,17 @@ def cmd_start(args):
              "--session", target, "--name", name],
         )
     else:
-        proc = subprocess.Popen(
-            [sys.executable, str(monitor_script),
-             "--session", target, "--name", name],
-            stdout=open(log_file, "a"),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        log_fh = open(log_file, "a")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(monitor_script),
+                 "--session", target, "--name", name],
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            log_fh.close()
         print(f"Monitor started: session={target}, name={name}, PID={proc.pid}")
         print(f"Logs: {log_file}")
 
@@ -125,18 +143,38 @@ def cmd_start(args):
 def cmd_stop(args):
     """Stop monitoring a session."""
     name = args.name
-    result = subprocess.run(
-        ["pgrep", "-f", f"monitor.py.*--name.*{name}"],
-        capture_output=True, text=True,
-    )
-    pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
-    if not pids:
+    stopped = False
+
+    # Try PID file first
+    pid = read_pid_file(name)
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        print(f"Stopped monitor PID {pid}")
+        stopped = True
+    else:
+        # Fallback: pgrep
+        result = subprocess.run(
+            ["pgrep", "-f", f"monitor.py.*--name.*{name}"],
+            capture_output=True, text=True,
+        )
+        pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
+        if pids:
+            for p in pids:
+                try:
+                    os.kill(int(p), signal.SIGTERM)
+                    print(f"Stopped monitor PID {p}")
+                    stopped = True
+                except ProcessLookupError:
+                    pass
+
+    if not stopped:
         print(f"No monitor running for '{name}'.")
         return
 
-    for pid in pids:
-        os.kill(int(pid), signal.SIGTERM)
-        print(f"Stopped monitor PID {pid}")
+    # Clean up PID file
+    pid_file = PID_DIR / f"{name}.pid"
+    if pid_file.exists():
+        pid_file.unlink()
 
     # Clean heartbeat
     hb = HEARTBEAT_DIR / name

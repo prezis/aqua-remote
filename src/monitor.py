@@ -18,14 +18,20 @@ Features:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Ensure src/ is on path regardless of CWD
+SRC_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SRC_DIR))
 
 from notify import create_channel, load_config, NotifyChannel
 
@@ -42,6 +48,7 @@ RECOVERY_BACKOFF = 300  # 5 min between recovery attempts
 LOG_DIR = Path.home() / ".aqua-remote" / "logs"
 STATE_DIR = Path.home() / ".aqua-remote" / "state"
 HEARTBEAT_DIR = Path.home() / ".aqua-remote" / "heartbeats"
+PID_DIR = Path.home() / ".aqua-remote" / "pids"
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +59,7 @@ def _ensure_dirs():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     HEARTBEAT_DIR.mkdir(parents=True, exist_ok=True)
+    PID_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class Logger:
@@ -101,11 +109,25 @@ def send_tmux(target: str, keys: str, enter: bool = True):
 
 
 def find_remote_url(text: str) -> str | None:
-    """Find RC URL in tmux output."""
-    urls = re.findall(r'https://[^\s]+remote[^\s]*', text, re.IGNORECASE)
+    """Find RC URL in tmux output.
+
+    Matches Claude Remote Control URLs from anthropic.com or claude.ai domains.
+    """
+    # Primary: console.anthropic.com/claude-code/remote?...
+    urls = re.findall(
+        r'https://console\.anthropic\.com/claude-code/remote\?[^\s]+',
+        text, re.IGNORECASE,
+    )
     if not urls:
+        # Fallback: claude.ai remote URLs
         urls = re.findall(
-            r'https://(?:console\.anthropic|claude\.ai)[^\s]+',
+            r'https://claude\.ai/[^\s]*remote[^\s]*',
+            text, re.IGNORECASE,
+        )
+    if not urls:
+        # Broad fallback: any anthropic/claude URL with "remote" in path
+        urls = re.findall(
+            r'https://(?:console\.anthropic\.com|claude\.ai)/[^\s]*',
             text, re.IGNORECASE,
         )
     return urls[-1] if urls else None
@@ -124,13 +146,49 @@ def detect_rc_state(content: str) -> str:
 
 
 def is_pilot_busy(content: str) -> bool:
-    """Check if the session is actively working."""
+    """Check if the session is actively working.
+
+    Detects:
+    - "esc to interrupt" — universal indicator of active Claude processing
+    - Braille spinner characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏) at start of line
+    - Common activity words as fallback
+    """
     tail = "\n".join(content.strip().split("\n")[-5:])
-    return bool(re.search(
-        r"esc to interrupt|Running|thinking|Working|Channeling|Symbioting|"
-        r"Sautéed|Baked|Flowing|Crunched",
-        tail,
-    ))
+    # Universal: "esc to interrupt" shown during all active processing
+    if "esc to interrupt" in tail:
+        return True
+    # Braille spinner characters at start of any line
+    if re.search(r'^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]', tail, re.MULTILINE):
+        return True
+    # Fallback: common processing indicators
+    if re.search(r"Running|thinking|Working", tail, re.IGNORECASE):
+        return True
+    return False
+
+
+def is_user_typing(content: str) -> bool:
+    """Check if the user appears to be mid-input.
+
+    NOTE: "Type your message" is the PLACEHOLDER shown when input is EMPTY.
+    Its presence means user is NOT typing — safe to send commands.
+    When user types, the placeholder disappears and their text appears instead.
+
+    Detects:
+    - "Pasted text" indicator (user just pasted a block)
+    - Prompt line (❯) with text after cursor (user mid-sentence)
+    - "queued messages" — user has pending input queued
+    """
+    tail = "\n".join(content.strip().split("\n")[-5:])
+    # Paste indicator — user just pasted something
+    if "Pasted text" in tail:
+        return True
+    # Prompt with user-typed text after it (not just bare prompt)
+    if re.search(r'❯\s+\S', tail):
+        return True
+    # Queued messages waiting to be processed
+    if "queued messages" in tail:
+        return True
+    return False
 
 
 def detect_meaningful_change(old: str, new: str) -> bool:
@@ -159,9 +217,18 @@ def recover_rc(target: str, log: Logger) -> str | None:
     """Attempt to recover RC link. Returns URL or None."""
     content = capture_tmux(target, 30)
 
+    # Check if user is currently typing — never interrupt user input
+    if is_user_typing(content):
+        log.log("User appears to be typing — postponing recovery")
+        return None
+
     # If reconnecting, disconnect first
     if "reconnecting" in detect_rc_state(content):
         log.log("RC reconnecting — disconnecting first")
+        # Re-check user typing before sending keys
+        if is_user_typing(capture_tmux(target, 10)):
+            log.log("User typing detected before disconnect — postponing")
+            return None
         send_tmux(target, "/disconnect")
         time.sleep(5)
         content = capture_tmux(target, 10)
@@ -174,6 +241,11 @@ def recover_rc(target: str, log: Logger) -> str | None:
     # Check if session is on prompt (not busy)
     if is_pilot_busy(capture_tmux(target, 10)):
         log.log("Session busy — postponing recovery")
+        return None
+
+    # Final check: user might have started typing during our checks
+    if is_user_typing(capture_tmux(target, 10)):
+        log.log("User started typing — postponing recovery")
         return None
 
     # Send /remote-control
@@ -248,6 +320,41 @@ def check_heartbeat(session_name: str, max_age: int = 300) -> bool:
 # Main loop
 # ---------------------------------------------------------------------------
 
+def _write_pid_file(session_name: str) -> Path:
+    """Write PID file and register cleanup."""
+    pid_file = PID_DIR / f"{session_name}.pid"
+    pid_file.write_text(str(os.getpid()))
+    return pid_file
+
+
+def _remove_pid_file(session_name: str):
+    """Remove PID file."""
+    pid_file = PID_DIR / f"{session_name}.pid"
+    try:
+        pid_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def read_pid_file(session_name: str) -> int | None:
+    """Read PID from file. Returns PID or None if missing/stale."""
+    pid_file = PID_DIR / f"{session_name}.pid"
+    if not pid_file.exists():
+        return None
+    try:
+        pid = int(pid_file.read_text().strip())
+        # Check if process is actually running
+        os.kill(pid, 0)
+        return pid
+    except (ValueError, ProcessLookupError, PermissionError):
+        # Stale PID file — clean up
+        try:
+            pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+
+
 def run_monitor(tmux_target: str, session_name: str):
     """Main monitoring loop."""
     _ensure_dirs()
@@ -255,7 +362,29 @@ def run_monitor(tmux_target: str, session_name: str):
     channel = create_channel()
     state = load_state(session_name)
 
-    log.log(f"=== aqua-remote monitor START === session={session_name} target={tmux_target}")
+    # Write PID file
+    pid_file = _write_pid_file(session_name)
+    atexit.register(_remove_pid_file, session_name)
+
+    # SIGTERM handler for clean shutdown
+    def _sigterm_handler(signum, frame):
+        log.log("Monitor stopped (SIGTERM)")
+        channel.send(
+            f"aqua-remote: {session_name} — stopped",
+            f"Monitor for <code>{tmux_target}</code> received SIGTERM.",
+        )
+        _remove_pid_file(session_name)
+        # Remove heartbeat so watchdog knows we're gone intentionally
+        hb_file = HEARTBEAT_DIR / session_name
+        try:
+            hb_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    log.log(f"=== aqua-remote monitor START === session={session_name} target={tmux_target} pid={os.getpid()}")
     channel.send(
         f"aqua-remote: {session_name} started",
         f"Monitoring tmux session <code>{tmux_target}</code>.\n"
@@ -338,6 +467,8 @@ def run_monitor(tmux_target: str, session_name: str):
                     )
                 elif is_pilot_busy(content):
                     log.log("Session busy — postponing recovery")
+                elif is_user_typing(content):
+                    log.log("User typing — postponing recovery")
                 else:
                     count = state.get("recovery_count_today", 0) + 1
                     channel.send(

@@ -1,4 +1,25 @@
 __pycache__/
 *.pyc
+*.pyo
 .env
 *.log
+
+# Build / packaging
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# aqua-remote runtime (never commit credentials)
+config.json

@@ -129,32 +129,21 @@ python3 src/cli.py test
 python3 src/cli.py start --session sol:0 --name pilot --foreground
 ```
 
-## As a Claude Code Skill
-
-Add to your Claude Code skills for instant setup:
-
-```bash
-# In any Claude Code session:
-/aqua-remote
-```
-
-The skill will detect your tmux session, configure monitoring, and start sending you links.
-
 ## How It Works
 
-```
-┌──────────────┐     ┌─────────────┐     ┌──────────────┐
-│  Claude Code  │────▶│   monitor   │────▶│  Telegram /   │
-│  in tmux     │     │  (Python)   │     │  Discord /    │
-│  sol:0       │◀────│             │     │  Email        │
-└──────────────┘     └──────┬──────┘     └──────────────┘
-                            │
-                     ┌──────▼──────┐
-                     │  watchdog   │
-                     │  (cron)     │
-                     │  restarts   │
-                     │  if dead    │
-                     └─────────────┘
+```text
++----------------+     +---------------+     +----------------+
+|  Claude Code   |---->|    monitor    |---->|  Telegram /    |
+|  in tmux       |     |   (Python)    |     |  Discord /     |
+|  sol:0         |<----|               |     |  Email         |
++----------------+     +-------+-------+     +----------------+
+                                |
+                        +-------v-------+
+                        |   watchdog    |
+                        |   (cron)      |
+                        |   restarts    |
+                        |   if dead     |
+                        +---------------+
 ```
 
 1. **Monitor** captures tmux output every 30s, detects RC URLs and connection state
@@ -191,6 +180,20 @@ A: No. tmux is required because aqua-remote reads session output via `tmux captu
 
 **Q: Is this safe? Does it send my code/conversations?**
 A: aqua-remote only reads the last 80 lines of tmux output to detect RC URLs and connection state. It never reads, stores, or sends your code or conversation content. The only data sent to your notification channel is: RC links, connection status alerts, and session names.
+
+**Q: Where are my credentials stored?**
+A: In `~/.aqua-remote/config.json` with chmod 600 (owner-only read). See the Security section below.
+
+## Security
+
+- **Config file** (`~/.aqua-remote/config.json`) stores notification credentials (bot tokens, webhook URLs, SMTP passwords) in **plaintext** with `chmod 600` (owner-read-only).
+- **Do not commit** `config.json` to version control. It is listed in `.gitignore`.
+- The monitor only reads tmux pane output to detect RC URLs and connection state. It does not access your code, conversation content, or any files outside `~/.aqua-remote/`.
+- PID files and heartbeats in `~/.aqua-remote/` contain only process IDs and timestamps.
+
+## Contributing
+
+PRs welcome! Please open an issue first for large changes.
 
 ## License
 
