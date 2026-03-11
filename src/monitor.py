@@ -583,7 +583,7 @@ def run_monitor(tmux_target: str, session_name: str):
                 )
                 log.log(f"New RC URL: {url[:60]}...")
 
-            # Check idle / reconnecting
+            # Check idle / reconnecting / RC dropped
             idle_time = now - last_change_ts
             should_recover = False
 
@@ -593,10 +593,19 @@ def run_monitor(tmux_target: str, session_name: str):
                 disconnect_notified = True
                 log.log("RC reconnecting detected (>10min since last recovery)", "WARN")
 
+            # RC was connected but now it's gone — recover immediately
+            if rc_state == "unknown" and state.get("last_rc_state") == "connected" and time_since_recovery > RECOVERY_BACKOFF:
+                should_recover = True
+                disconnect_notified = True
+                log.log("RC dropped (was connected, now gone) — triggering recovery", "WARN")
+
             if idle_time > DISCONNECT_THRESHOLD and not disconnect_notified:
                 should_recover = True
                 disconnect_notified = True
                 log.log(f"Idle timeout: {int(idle_time)}s", "WARN")
+
+            # Track RC state transitions
+            state["last_rc_state"] = rc_state
 
             # Recovery
             if should_recover and not recovery_in_progress:
