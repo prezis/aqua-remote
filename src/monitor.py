@@ -580,10 +580,6 @@ def run_monitor(tmux_target: str, session_name: str):
                 if disconnect_notified:
                     disconnect_notified = False
                     log.log("Activity resumed")
-                    channel.send(
-                        f"aqua-remote: {session_name} reconnected",
-                        f"Session <code>{tmux_target}</code> is active again.",
-                    )
             last_content = content
 
             # Dismiss any blocking menu/prompt ASAP — these halt the session
@@ -657,12 +653,7 @@ def run_monitor(tmux_target: str, session_name: str):
                     log.log("User typing — postponing recovery")
                 else:
                     count = state.get("recovery_count_today", 0) + 1
-                    channel.send(
-                        f"aqua-remote: {session_name} — recovering (#{count})",
-                        f"Session <code>{tmux_target}</code> idle for {int(idle_time)}s.\n"
-                        f"RC state: {rc_state}\n"
-                        f"Attempting auto-recovery...",
-                    )
+                    log.log(f"Starting recovery #{count} (idle={int(idle_time)}s, rc={rc_state})")
                     recovery_in_progress = True
                     new_url = recover_rc(tmux_target, log)
                     recovery_in_progress = False
@@ -678,6 +669,20 @@ def run_monitor(tmux_target: str, session_name: str):
                         if new_url:
                             state["last_url"] = new_url
                         save_state(session_name, state)
+                        # Single notification with result + link (no spam)
+                        if new_url:
+                            channel.send(
+                                f"aqua-remote: {session_name} — RC recovered",
+                                f"<code>{new_url}</code>\n\n"
+                                f"Click to connect. (recovery #{count})",
+                            )
+                        else:
+                            channel.send(
+                                f"aqua-remote: {session_name} — recovery failed",
+                                f"Session <code>{tmux_target}</code> recovery #{count} "
+                                f"did not produce a new RC link.\n"
+                                f"RC state: {rc_state}",
+                            )
 
             # Heartbeat
             write_heartbeat(session_name)
