@@ -9,10 +9,20 @@ Usage:
 Features:
 - Detects idle sessions (no meaningful output change)
 - Detects "RC reconnecting" state
-- Auto-recovery: sends /disconnect + /remote-control
+- Auto-recovery via RC menu (Claude Code has NO /disconnect command!)
 - Sends new RC link to configured notification channel
 - Heartbeat file for external watchdog
 - Session name in all alerts
+
+Recovery strategy (learned the hard way):
+- Claude Code has NO /disconnect command — sending it causes "Unknown skill" spam.
+- To disconnect: send /remote-control → wait for menu → Up Up Enter (selects Disconnect).
+- To reconnect: send /remote-control → wait for menu → Enter (Continue is default).
+- For "reconnecting" state: Ctrl+C + Escape to clear, then fresh /remote-control.
+- NEVER send tmux keys directly to a window with an active Claude session from
+  the same window — open a helper window instead.
+- Bridge pointer cleanup: rm ~/.claude/projects/*/bridge-pointer.json helps clear
+  stale reconnecting state.
 """
 
 from __future__ import annotations
@@ -204,6 +214,13 @@ def detect_meaningful_change(old: str, new: str) -> bool:
                 continue
             if re.match(r'^\d{2}:\d{2}:\d{2}\s*$', s):
                 continue
+            # Skip recovery-induced noise (prevents feedback loop)
+            if "Unknown skill" in s:
+                continue
+            if "Remote Control reconnecting" in s:
+                continue
+            if "Remote Control connecting" in s:
+                continue
             out.append(s)
         return out[-8:]
     return sig_lines(old) != sig_lines(new)
@@ -213,8 +230,48 @@ def detect_meaningful_change(old: str, new: str) -> bool:
 # Recovery
 # ---------------------------------------------------------------------------
 
+def _cleanup_bridge_pointers(log: Logger):
+    """Remove stale bridge-pointer.json files that cause reconnecting loops."""
+    claude_dir = Path.home() / ".claude" / "projects"
+    if not claude_dir.exists():
+        return
+    for bp in claude_dir.rglob("bridge-pointer.json"):
+        try:
+            bp.unlink()
+            log.log(f"Removed stale bridge pointer: {bp}")
+        except Exception:
+            pass
+
+
+def _dismiss_menu_or_prompt(target: str, content: str, log: Logger):
+    """Dismiss RC menu (select Continue) or rating prompts."""
+    # RC menu: "Enter to select" with Continue/Disconnect options
+    if re.search(r"Enter to select|Continue.*Disconnect|Disconnect this session", content):
+        # "Continue" is the default (bottom option) — just press Enter
+        log.log("RC menu detected — pressing Enter (Continue)")
+        send_tmux(target, "", enter=True)
+        time.sleep(3)
+        return True
+
+    # Rating prompt: "How is Claude doing"
+    if re.search(r"How is Claude doing", content):
+        log.log("Rating prompt detected — dismissing")
+        send_tmux(target, "0")
+        time.sleep(2)
+        return True
+
+    return False
+
+
 def recover_rc(target: str, log: Logger) -> str | None:
-    """Attempt to recover RC link. Returns URL or None."""
+    """Attempt to recover RC link. Returns URL or None.
+
+    Recovery strategy:
+    1. If "reconnecting" → Ctrl+C + Escape + bridge cleanup → fresh /remote-control
+    2. If stuck on menu → dismiss (Enter for Continue)
+    3. Send /remote-control → wait for URL → auto-accept Continue menu
+    4. Verify session resumed
+    """
     content = capture_tmux(target, 30)
 
     # Check if user is currently typing — never interrupt user input
@@ -222,21 +279,29 @@ def recover_rc(target: str, log: Logger) -> str | None:
         log.log("User appears to be typing — postponing recovery")
         return None
 
-    # If reconnecting, disconnect first
+    # If reconnecting, clear stale state first
+    # NOTE: Claude Code has NO /disconnect command — use Ctrl+C + Escape instead
     if "reconnecting" in detect_rc_state(content):
-        log.log("RC reconnecting — disconnecting first")
+        log.log("RC reconnecting — clearing stale state with Ctrl+C + bridge cleanup")
         # Re-check user typing before sending keys
         if is_user_typing(capture_tmux(target, 10)):
-            log.log("User typing detected before disconnect — postponing")
+            log.log("User typing detected before clearing — postponing")
             return None
-        send_tmux(target, "/disconnect")
-        time.sleep(5)
+        # Clean up stale bridge pointer files
+        _cleanup_bridge_pointers(log)
+        # Cancel reconnecting with Ctrl+C then Escape
+        send_tmux(target, "C-c", enter=False)
+        time.sleep(3)
+        send_tmux(target, "Escape", enter=False)
+        time.sleep(3)
         content = capture_tmux(target, 10)
         if "reconnecting" in content.lower():
-            send_tmux(target, "C-c", enter=False)
-            time.sleep(2)
-            send_tmux(target, "/disconnect")
-            time.sleep(5)
+            log.log("Still reconnecting after Ctrl+C — waiting longer")
+            time.sleep(10)
+
+    # If stuck on an old RC menu or rating prompt, dismiss it
+    content = capture_tmux(target, 10)
+    _dismiss_menu_or_prompt(target, content, log)
 
     # Check if session is on prompt (not busy)
     if is_pilot_busy(capture_tmux(target, 10)):
@@ -259,20 +324,29 @@ def recover_rc(target: str, log: Logger) -> str | None:
     if url:
         log.log(f"RC URL found: {url[:60]}...")
 
-    # Handle menu prompts (Enter to continue)
-    if re.search(r"Enter to select|Continue|How is Claude", content):
-        send_tmux(target, "")  # just Enter
-        time.sleep(3)
+    # Handle menu prompts — press Enter to select "Continue" (default)
+    _dismiss_menu_or_prompt(target, content, log)
 
-    # Verify session is active
-    for attempt in range(6):
+    # Verify session is active (max 60s)
+    for attempt in range(12):
         time.sleep(5)
         check = capture_tmux(target, 10)
+
+        # Session is back if busy or on prompt
         if is_pilot_busy(check) or re.search(r"^❯", check, re.MULTILINE):
-            log.log(f"Session active after {attempt + 1} checks")
+            log.log(f"Session active after {(attempt + 1) * 5}s")
             break
+
+        # Still on menu? Keep pressing Enter
+        if re.search(r"Enter to select|Continue|Disconnect", check):
+            log.log("Still on RC menu — pressing Enter")
+            send_tmux(target, "", enter=True)
+
+        # Rating prompt? Dismiss
+        if re.search(r"How is Claude doing", check):
+            send_tmux(target, "0")
     else:
-        log.log("Session did not resume after recovery", "WARN")
+        log.log("Session did not resume after 60s recovery", "WARN")
 
     return url
 
@@ -443,10 +517,11 @@ def run_monitor(tmux_target: str, session_name: str):
             idle_time = now - last_change_ts
             should_recover = False
 
-            if rc_state == "reconnecting" and not disconnect_notified:
+            time_since_recovery = now - state.get("last_recovery_ts", 0)
+            if rc_state == "reconnecting" and not disconnect_notified and time_since_recovery > 600:
                 should_recover = True
                 disconnect_notified = True
-                log.log("RC reconnecting detected", "WARN")
+                log.log("RC reconnecting detected (>10min since last recovery)", "WARN")
 
             if idle_time > DISCONNECT_THRESHOLD and not disconnect_notified:
                 should_recover = True

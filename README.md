@@ -147,9 +147,11 @@ python3 src/cli.py start --session sol:0 --name pilot --foreground
 ```
 
 1. **Monitor** captures tmux output every 30s, detects RC URLs and connection state
-2. **Auto-recovery** triggers after 15 min idle: sends `/disconnect` then `/remote-control`
+2. **Auto-recovery** triggers after 15 min idle: clears stale state, sends `/remote-control`, auto-accepts the Continue menu
 3. **Heartbeat file** written every 30s — watchdog cron checks it every 5 min
 4. **If monitor dies** (OOM, crash) → watchdog restarts it and alerts you
+
+> **Note:** Claude Code has no `/disconnect` command. Recovery uses `Ctrl+C` + `Escape` to clear stale "reconnecting" state, then sends a fresh `/remote-control`. The RC menu (Continue/Disconnect) is auto-handled.
 
 ## Config
 
