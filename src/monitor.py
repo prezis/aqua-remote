@@ -302,7 +302,7 @@ def recover_rc(target: str, log: Logger) -> str | None:
     # Check if user was recently active (e.g. typing on phone via RC)
     # Skip this attempt — main loop will retry after CHECK_INTERVAL cycles
     if is_user_recently_active(60):
-        log.log("User active <60s ago — postponing recovery 15min (RC protection)")
+        log.log("User active <60s ago — will retry next cycle (RC protection)")
         return "SKIP_USER_ACTIVE"
 
     # Check if user is currently typing — never interrupt user input
@@ -531,6 +531,7 @@ def run_monitor(tmux_target: str, session_name: str):
     last_heartbeat_log_ts = 0.0
     disconnect_notified = False
     recovery_in_progress = False
+    needs_recovery = False  # persistent flag: RC is down, keep retrying
 
     # Immediate check on startup: dismiss any blocking menu/prompt
     # that may have been left by a previous /remote-control invocation
@@ -608,28 +609,36 @@ def run_monitor(tmux_target: str, session_name: str):
             should_recover = False
 
             time_since_recovery = now - state.get("last_recovery_ts", 0)
-            if rc_state == "reconnecting" and not disconnect_notified and time_since_recovery > 600:
-                should_recover = True
-                disconnect_notified = True
-                log.log("RC reconnecting detected (>10min since last recovery)", "WARN")
 
-            # RC was connected but now it's gone — recover
-            # But NOT if /remote-control is already queued on the prompt (waiting for pilot)
-            # Only check last 3 lines for queued command — scrollback may still contain
-            # old /remote-control text even after RC is already active
+            # Clear needs_recovery when RC comes back
+            if rc_state == "connected" and needs_recovery:
+                needs_recovery = False
+                log.log("RC is back — clearing needs_recovery flag")
+
+            # Check for queued /remote-control on prompt (last 3 lines only)
             prompt_area = "\n".join(content.strip().split("\n")[-3:])
             rc_queued = bool(re.search(r'❯.*/?remote-control', prompt_area))
-            if rc_state == "unknown" and state.get("last_rc_state") == "connected" and time_since_recovery > RECOVERY_BACKOFF and not rc_queued:
-                should_recover = True
-                # Don't set disconnect_notified — keep retrying until RC is back
-                log.log("RC dropped (was connected, now gone) — triggering recovery", "WARN")
-            elif rc_queued:
-                log.log("RC command queued on prompt — waiting, not re-sending")
 
-            # Idle timeout recovery — ONLY when RC is NOT connected
-            # When RC is connected and session is idle, that's normal (waiting for user input)
-            if idle_time > DISCONNECT_THRESHOLD and not disconnect_notified and rc_state != "connected":
+            if rc_queued:
+                # Command already on prompt — don't send another, just wait
+                pass
+            elif rc_state == "reconnecting" and time_since_recovery > 600:
                 should_recover = True
+                needs_recovery = True
+                log.log("RC reconnecting detected (>10min since last recovery)", "WARN")
+            elif rc_state == "unknown" and state.get("last_rc_state") == "connected" and time_since_recovery > RECOVERY_BACKOFF:
+                # RC just dropped (was connected, now gone)
+                should_recover = True
+                needs_recovery = True
+                log.log("RC dropped (was connected, now gone) — triggering recovery", "WARN")
+            elif needs_recovery and rc_state != "connected" and time_since_recovery > RECOVERY_BACKOFF:
+                # RC still down from a previous drop — keep retrying
+                should_recover = True
+                log.log(f"RC still down — retrying recovery (last attempt {int(time_since_recovery)}s ago)", "WARN")
+            elif idle_time > DISCONNECT_THRESHOLD and not disconnect_notified and rc_state != "connected":
+                # Idle timeout — ONLY when RC is NOT connected
+                should_recover = True
+                needs_recovery = True
                 disconnect_notified = True
                 log.log(f"Idle timeout: {int(idle_time)}s, rc={rc_state}", "WARN")
 
@@ -659,10 +668,9 @@ def run_monitor(tmux_target: str, session_name: str):
                     recovery_in_progress = False
 
                     if new_url == "SKIP_USER_ACTIVE":
-                        # User active — retry after backoff, don't count as attempt
-                        state["last_recovery_ts"] = now
-                        disconnect_notified = False  # allow re-trigger next cycle
-                        save_state(session_name, state)
+                        # User active — retry next cycle (don't set recovery_ts,
+                        # so backoff doesn't block). needs_recovery stays True.
+                        pass
                     else:
                         state["last_recovery_ts"] = now
                         state["recovery_count_today"] = count
