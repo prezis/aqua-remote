@@ -129,7 +129,9 @@ def cmd_start(args):
         print(f"Monitor started: session={target}, name={name}, PID={proc.pid}")
         print(f"Logs: {log_file}")
 
-        # Also trigger /remote-control in the target session
+        # Optionally trigger /remote-control in the target session
+        # Default: OFF — RC is usually already active, sending it opens a
+        # blocking menu that halts the session until someone presses Enter.
         if args.rc:
             print(f"Sending /remote-control to {target}...")
             import time
@@ -291,8 +293,10 @@ def main():
     p_start.add_argument("--name", "-n", default="", help="Session name (e.g. pilot)")
     p_start.add_argument("--force", "-f", action="store_true", help="Restart if already running")
     p_start.add_argument("--foreground", action="store_true", help="Run in foreground")
-    p_start.add_argument("--no-rc", dest="rc", action="store_false", default=True,
-                          help="Don't auto-send /remote-control")
+    p_start.add_argument("--rc", dest="rc", action="store_true", default=False,
+                          help="Auto-send /remote-control on start (default: off, RC usually already active)")
+    p_start.add_argument("--no-rc", dest="rc", action="store_false",
+                          help="Don't auto-send /remote-control (default)")
 
     # stop
     p_stop = subs.add_parser("stop", help="Stop monitoring a session")

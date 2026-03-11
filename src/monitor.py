@@ -59,6 +59,7 @@ LOG_DIR = Path.home() / ".aqua-remote" / "logs"
 STATE_DIR = Path.home() / ".aqua-remote" / "state"
 HEARTBEAT_DIR = Path.home() / ".aqua-remote" / "heartbeats"
 PID_DIR = Path.home() / ".aqua-remote" / "pids"
+RC_USER_ACTIVITY_FILE = Path("/tmp/rc_user_activity")
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +84,8 @@ class Logger:
     def log(self, msg: str, level: str = "INFO"):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {level}: {msg}"
-        print(line, flush=True)
+        # Write to file only — stdout is redirected to the same file by cli.py
+        # Writing to both causes duplicate lines.
         try:
             with open(self.log_file, "a") as f:
                 f.write(line + "\n")
@@ -111,8 +113,13 @@ def capture_tmux(target: str, lines: int = 80) -> str:
 
 
 def send_tmux(target: str, keys: str, enter: bool = True):
-    """Send keys to a tmux pane."""
-    cmd = ["tmux", "send-keys", "-t", target, keys]
+    """Send keys to a tmux pane.
+
+    If keys is empty and enter=True, sends just Enter (no empty string arg).
+    """
+    cmd = ["tmux", "send-keys", "-t", target]
+    if keys:
+        cmd.append(keys)
     if enter:
         cmd.append("Enter")
     subprocess.run(cmd, timeout=5, capture_output=True)
@@ -201,6 +208,25 @@ def is_user_typing(content: str) -> bool:
     return False
 
 
+def touch_user_activity():
+    """Mark that user/session was recently active. Used to prevent interruption."""
+    try:
+        RC_USER_ACTIVITY_FILE.write_text(str(int(time.time())))
+    except Exception:
+        pass
+
+
+def is_user_recently_active(seconds: int = 60) -> bool:
+    """Check if user was active within last N seconds."""
+    try:
+        if not RC_USER_ACTIVITY_FILE.exists():
+            return False
+        ts = int(RC_USER_ACTIVITY_FILE.read_text().strip())
+        return (int(time.time()) - ts) < seconds
+    except Exception:
+        return False
+
+
 def detect_meaningful_change(old: str, new: str) -> bool:
     """Check if tmux content changed meaningfully."""
     def sig_lines(text: str) -> list[str]:
@@ -249,7 +275,7 @@ def _dismiss_menu_or_prompt(target: str, content: str, log: Logger):
     if re.search(r"Enter to select|Continue.*Disconnect|Disconnect this session", content):
         # "Continue" is the default (bottom option) — just press Enter
         log.log("RC menu detected — pressing Enter (Continue)")
-        send_tmux(target, "", enter=True)
+        send_tmux(target, "Enter", enter=False)
         time.sleep(3)
         return True
 
@@ -273,6 +299,12 @@ def recover_rc(target: str, log: Logger) -> str | None:
     4. Verify session resumed
     """
     content = capture_tmux(target, 30)
+
+    # Check if user was recently active (e.g. typing on phone via RC)
+    # Skip this attempt — main loop will retry after CHECK_INTERVAL cycles
+    if is_user_recently_active(60):
+        log.log("User active <60s ago — postponing recovery 15min (RC protection)")
+        return "SKIP_USER_ACTIVE"
 
     # Check if user is currently typing — never interrupt user input
     if is_user_typing(content):
@@ -303,10 +335,8 @@ def recover_rc(target: str, log: Logger) -> str | None:
     content = capture_tmux(target, 10)
     _dismiss_menu_or_prompt(target, content, log)
 
-    # Check if session is on prompt (not busy)
-    if is_pilot_busy(capture_tmux(target, 10)):
-        log.log("Session busy — postponing recovery")
-        return None
+    # NOTE: Do NOT skip recovery when pilot is busy — RC must work even during processing.
+    # /remote-control queues in terminal buffer and executes when pilot finishes.
 
     # Final check: user might have started typing during our checks
     if is_user_typing(capture_tmux(target, 10)):
@@ -340,7 +370,7 @@ def recover_rc(target: str, log: Logger) -> str | None:
         # Still on menu? Keep pressing Enter
         if re.search(r"Enter to select|Continue|Disconnect", check):
             log.log("Still on RC menu — pressing Enter")
-            send_tmux(target, "", enter=True)
+            send_tmux(target, "Enter", enter=False)
 
         # Rating prompt? Dismiss
         if re.search(r"How is Claude doing", check):
@@ -471,6 +501,26 @@ def run_monitor(tmux_target: str, session_name: str):
     disconnect_notified = False
     recovery_in_progress = False
 
+    # Immediate check on startup: dismiss any blocking menu/prompt
+    # that may have been left by a previous /remote-control invocation
+    time.sleep(3)
+    startup_content = capture_tmux(tmux_target, 30)
+    if startup_content:
+        if _dismiss_menu_or_prompt(tmux_target, startup_content, log):
+            log.log("Dismissed blocking menu/prompt on startup")
+        # Also capture any RC URL visible at startup
+        startup_url = find_remote_url(startup_content)
+        if startup_url and startup_url != state.get("last_url"):
+            state["last_url"] = startup_url
+            save_state(session_name, state)
+            channel.send(
+                f"aqua-remote: {session_name} — RC link",
+                f"Session: <code>{tmux_target}</code>\n\n"
+                f"<code>{startup_url}</code>\n\n"
+                f"Click to connect.",
+            )
+            log.log(f"Startup RC URL: {startup_url[:60]}...")
+
     while True:
         try:
             content = capture_tmux(tmux_target, 80)
@@ -490,6 +540,12 @@ def run_monitor(tmux_target: str, session_name: str):
             # Detect meaningful change
             if detect_meaningful_change(last_content, content):
                 last_change_ts = now
+                # Only mark user activity when session transitions from idle→busy
+                # (= user just sent a message). Claude's own output doesn't count.
+                was_idle = not is_pilot_busy(last_content) if last_content else False
+                now_busy = is_pilot_busy(content)
+                if was_idle and now_busy:
+                    touch_user_activity()
                 if disconnect_notified:
                     disconnect_notified = False
                     log.log("Activity resumed")
@@ -498,6 +554,13 @@ def run_monitor(tmux_target: str, session_name: str):
                         f"Session <code>{tmux_target}</code> is active again.",
                     )
             last_content = content
+
+            # Dismiss any blocking menu/prompt ASAP — these halt the session
+            if _dismiss_menu_or_prompt(tmux_target, content, log):
+                # Re-capture after dismiss to get clean state
+                time.sleep(3)
+                content = capture_tmux(tmux_target, 80)
+                last_change_ts = now  # reset idle timer after dismiss
 
             # Detect RC state and URL
             rc_state = detect_rc_state(content)
@@ -540,8 +603,7 @@ def run_monitor(tmux_target: str, session_name: str):
                         f"Session <code>{tmux_target}</code> hit {MAX_RECOVERIES_PER_DAY} "
                         f"recoveries today. Check manually.",
                     )
-                elif is_pilot_busy(content):
-                    log.log("Session busy — postponing recovery")
+                # NOTE: pilot busy does NOT block recovery — RC must always work
                 elif is_user_typing(content):
                     log.log("User typing — postponing recovery")
                 else:
@@ -556,11 +618,17 @@ def run_monitor(tmux_target: str, session_name: str):
                     new_url = recover_rc(tmux_target, log)
                     recovery_in_progress = False
 
-                    state["last_recovery_ts"] = now
-                    state["recovery_count_today"] = count
-                    if new_url:
-                        state["last_url"] = new_url
-                    save_state(session_name, state)
+                    if new_url == "SKIP_USER_ACTIVE":
+                        # User active — retry in 15 min, don't count as recovery attempt
+                        state["last_recovery_ts"] = now - RECOVERY_BACKOFF + 900
+                        disconnect_notified = False  # allow re-trigger after 15 min
+                        save_state(session_name, state)
+                    else:
+                        state["last_recovery_ts"] = now
+                        state["recovery_count_today"] = count
+                        if new_url:
+                            state["last_url"] = new_url
+                        save_state(session_name, state)
 
             # Heartbeat
             write_heartbeat(session_name)
