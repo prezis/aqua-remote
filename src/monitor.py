@@ -354,9 +354,10 @@ def recover_rc(target: str, log: Logger) -> str | None:
     log.log("Sending /remote-control...")
     send_tmux(target, "/remote-control")
 
-    # Poll for RC URL or menu (max 45s) — handles both immediate and queued execution
+    # Poll for RC URL or menu (max 90s) — handles both immediate and queued execution
     log.log("Waiting for RC to process...")
-    for poll in range(9):
+    queued_logged = False
+    for poll in range(18):
         time.sleep(5)
         poll_content = capture_tmux(target, 30)
         # Menu appeared — dismiss it
@@ -369,6 +370,12 @@ def recover_rc(target: str, log: Logger) -> str | None:
         # RC active in status bar — done
         if "Remote Control active" in poll_content:
             break
+        # Command queued on prompt (pilot still busy) — wait patiently
+        if re.search(r'❯.*/?remote-control', poll_content):
+            if not queued_logged:
+                log.log("Command queued on prompt — waiting for pilot to finish...")
+                queued_logged = True
+            continue
 
     # Check for URL
     content = capture_tmux(target, 30)
@@ -609,10 +616,14 @@ def run_monitor(tmux_target: str, session_name: str):
                 log.log("RC reconnecting detected (>10min since last recovery)", "WARN")
 
             # RC was connected but now it's gone — recover
-            if rc_state == "unknown" and state.get("last_rc_state") == "connected" and time_since_recovery > RECOVERY_BACKOFF:
+            # But NOT if /remote-control is already queued on the prompt (waiting for pilot)
+            rc_queued = bool(re.search(r'❯.*/?remote-control', content))
+            if rc_state == "unknown" and state.get("last_rc_state") == "connected" and time_since_recovery > RECOVERY_BACKOFF and not rc_queued:
                 should_recover = True
                 # Don't set disconnect_notified — keep retrying until RC is back
                 log.log("RC dropped (was connected, now gone) — triggering recovery", "WARN")
+            elif rc_queued:
+                log.log("RC command queued on prompt — waiting, not re-sending")
 
             if idle_time > DISCONNECT_THRESHOLD and not disconnect_notified:
                 should_recover = True
