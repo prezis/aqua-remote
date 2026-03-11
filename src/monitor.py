@@ -49,11 +49,11 @@ from notify import create_channel, load_config, NotifyChannel
 # Config
 # ---------------------------------------------------------------------------
 
-CHECK_INTERVAL = 30  # seconds between checks
-DISCONNECT_THRESHOLD = 900  # 15 min idle = trigger recovery
+CHECK_INTERVAL = 15  # seconds between checks
+DISCONNECT_THRESHOLD = 120  # 2 min idle = trigger recovery
 HEARTBEAT_INTERVAL = 1800  # 30 min between logged heartbeats
-MAX_RECOVERIES_PER_DAY = 20
-RECOVERY_BACKOFF = 300  # 5 min between recovery attempts
+MAX_RECOVERIES_PER_DAY = 30
+RECOVERY_BACKOFF = 60  # 1 min between recovery attempts
 
 LOG_DIR = Path.home() / ".aqua-remote" / "logs"
 STATE_DIR = Path.home() / ".aqua-remote" / "state"
@@ -342,23 +342,33 @@ def recover_rc(target: str, log: Logger) -> str | None:
         log.log("User started typing — postponing recovery")
         return None
 
-    # Wait briefly for pilot to be idle (so /remote-control doesn't sit visible
-    # on prompt while Claude is busy). Max 30s wait, then send anyway.
-    for wait_attempt in range(6):
+    # Wait briefly for pilot to be idle (so /remote-control executes immediately
+    # instead of queuing). Max 15s wait, then send anyway.
+    for wait_attempt in range(3):
         if not is_pilot_busy(capture_tmux(target, 10)):
             break
-        log.log(f"Pilot busy — waiting for idle ({(wait_attempt+1)*5}s/30s)")
+        log.log(f"Pilot busy — waiting for idle ({(wait_attempt+1)*5}s/15s)")
         time.sleep(5)
 
     # Send /remote-control
     log.log("Sending /remote-control...")
     send_tmux(target, "/remote-control")
 
-    # Wait for command to execute — longer if pilot was busy (queued)
-    busy_after_send = is_pilot_busy(capture_tmux(target, 5))
-    wait_time = 30 if busy_after_send else 12
-    log.log(f"Waiting {wait_time}s for RC to process (busy={busy_after_send})")
-    time.sleep(wait_time)
+    # Poll for RC URL or menu (max 45s) — handles both immediate and queued execution
+    log.log("Waiting for RC to process...")
+    for poll in range(9):
+        time.sleep(5)
+        poll_content = capture_tmux(target, 30)
+        # Menu appeared — dismiss it
+        if _dismiss_menu_or_prompt(target, poll_content, log):
+            time.sleep(3)
+            break
+        # URL appeared — done
+        if find_remote_url(poll_content):
+            break
+        # RC active in status bar — done
+        if "Remote Control active" in poll_content:
+            break
 
     # Check for URL
     content = capture_tmux(target, 30)
@@ -598,10 +608,10 @@ def run_monitor(tmux_target: str, session_name: str):
                 disconnect_notified = True
                 log.log("RC reconnecting detected (>10min since last recovery)", "WARN")
 
-            # RC was connected but now it's gone — recover immediately
+            # RC was connected but now it's gone — recover
             if rc_state == "unknown" and state.get("last_rc_state") == "connected" and time_since_recovery > RECOVERY_BACKOFF:
                 should_recover = True
-                disconnect_notified = True
+                # Don't set disconnect_notified — keep retrying until RC is back
                 log.log("RC dropped (was connected, now gone) — triggering recovery", "WARN")
 
             if idle_time > DISCONNECT_THRESHOLD and not disconnect_notified:
@@ -640,9 +650,9 @@ def run_monitor(tmux_target: str, session_name: str):
                     recovery_in_progress = False
 
                     if new_url == "SKIP_USER_ACTIVE":
-                        # User active — retry in 15 min, don't count as recovery attempt
-                        state["last_recovery_ts"] = now - RECOVERY_BACKOFF + 900
-                        disconnect_notified = False  # allow re-trigger after 15 min
+                        # User active — retry after backoff, don't count as attempt
+                        state["last_recovery_ts"] = now
+                        disconnect_notified = False  # allow re-trigger next cycle
                         save_state(session_name, state)
                     else:
                         state["last_recovery_ts"] = now
