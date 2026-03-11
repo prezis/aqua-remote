@@ -371,7 +371,9 @@ def recover_rc(target: str, log: Logger) -> str | None:
         if "Remote Control active" in poll_content:
             break
         # Command queued on prompt (pilot still busy) — wait patiently
-        if re.search(r'❯.*/?remote-control', poll_content):
+        # Only check last 3 lines to avoid matching scrollback
+        poll_prompt = "\n".join(poll_content.strip().split("\n")[-3:])
+        if re.search(r'❯.*/?remote-control', poll_prompt):
             if not queued_logged:
                 log.log("Command queued on prompt — waiting for pilot to finish...")
                 queued_logged = True
@@ -617,7 +619,10 @@ def run_monitor(tmux_target: str, session_name: str):
 
             # RC was connected but now it's gone — recover
             # But NOT if /remote-control is already queued on the prompt (waiting for pilot)
-            rc_queued = bool(re.search(r'❯.*/?remote-control', content))
+            # Only check last 3 lines for queued command — scrollback may still contain
+            # old /remote-control text even after RC is already active
+            prompt_area = "\n".join(content.strip().split("\n")[-3:])
+            rc_queued = bool(re.search(r'❯.*/?remote-control', prompt_area))
             if rc_state == "unknown" and state.get("last_rc_state") == "connected" and time_since_recovery > RECOVERY_BACKOFF and not rc_queued:
                 should_recover = True
                 # Don't set disconnect_notified — keep retrying until RC is back
