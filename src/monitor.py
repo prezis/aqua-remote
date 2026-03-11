@@ -125,6 +125,20 @@ def send_tmux(target: str, keys: str, enter: bool = True):
     subprocess.run(cmd, timeout=5, capture_output=True)
 
 
+def send_tmux_hex(target: str, text: str, enter: bool = True):
+    """Send text to tmux pane as hex bytes via -H flag.
+
+    Bypasses bracketed paste mode / autocomplete ghost text issues.
+    Each character is sent as its hex byte value. If enter=True,
+    appends 0x0d (carriage return) to execute the command.
+    """
+    hex_bytes = [format(b, "02x") for b in text.encode("utf-8")]
+    if enter:
+        hex_bytes.append("0d")  # carriage return = Enter
+    cmd = ["tmux", "send-keys", "-t", target, "-H"] + hex_bytes
+    subprocess.run(cmd, timeout=5, capture_output=True)
+
+
 def find_remote_url(text: str) -> str | None:
     """Find RC URL in tmux output.
 
@@ -350,9 +364,13 @@ def recover_rc(target: str, log: Logger) -> str | None:
         log.log(f"Pilot busy — waiting for idle ({(wait_attempt+1)*5}s/15s)")
         time.sleep(5)
 
-    # Send /remote-control
-    log.log("Sending /remote-control...")
-    send_tmux(target, "/remote-control")
+    # Send /remote-control using hex bytes to bypass bracketed paste / ghost text
+    log.log("Sending /remote-control (hex mode)...")
+    send_tmux(target, "Escape", enter=False)  # clear any autocomplete state
+    time.sleep(0.5)
+    send_tmux(target, "C-u", enter=False)     # clear current line
+    time.sleep(0.5)
+    send_tmux_hex(target, "/remote-control", enter=True)
 
     # Poll for RC URL or menu (max 90s) — handles both immediate and queued execution
     log.log("Waiting for RC to process...")
@@ -370,12 +388,14 @@ def recover_rc(target: str, log: Logger) -> str | None:
         # RC active in status bar — done
         if "Remote Control active" in poll_content:
             break
-        # Command queued on prompt (pilot still busy) — wait patiently
+        # Command queued on prompt (pilot still busy or ghost text) — send extra Enter
         # Only check last 3 lines to avoid matching scrollback
         poll_prompt = "\n".join(poll_content.strip().split("\n")[-3:])
         if re.search(r'❯.*/?remote-control', poll_prompt):
             if not queued_logged:
-                log.log("Command queued on prompt — waiting for pilot to finish...")
+                log.log("Command queued on prompt — sending extra Enter to execute...")
+                # Ghost text fix: send Enter via hex to force execution
+                send_tmux_hex(target, "", enter=True)
                 queued_logged = True
             continue
 
@@ -387,6 +407,23 @@ def recover_rc(target: str, log: Logger) -> str | None:
 
     # Handle menu prompts — press Enter to select "Continue" (default)
     _dismiss_menu_or_prompt(target, content, log)
+
+    # Verify RC is active (poll for "Remote Control active" in status bar, max 30s)
+    rc_verified = False
+    for verify_poll in range(6):
+        time.sleep(5)
+        verify_content = capture_tmux(target, 10)
+        if "Remote Control active" in verify_content or re.search(
+            r'Remote Control.*connected|remote session active',
+            verify_content, re.IGNORECASE,
+        ):
+            rc_verified = True
+            log.log(f"RC verified active after {(verify_poll + 1) * 5}s")
+            break
+        # Dismiss any menu that appeared
+        _dismiss_menu_or_prompt(target, verify_content, log)
+    if not rc_verified:
+        log.log("RC not verified active after 30s — session may need manual check", "WARN")
 
     # Verify session is active (max 60s)
     for attempt in range(12):
