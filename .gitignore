@@ -2,7 +2,6 @@ __pycache__/
 *.pyc
 *.pyo
 .env
-*.log
 
 # Build / packaging
 *.egg-info/
@@ -21,5 +20,5 @@ env/
 *.swo
 *~
 
-# aqua-remote runtime (never commit credentials)
+# aqua-remote runtime (never commit credentials or state)
 config.json

@@ -4,34 +4,204 @@
 
 aqua-remote monitors your Claude Code sessions running in tmux, auto-recovers broken RC connections, and sends you the new link via Telegram, Discord, or email — so you can always connect from your phone.
 
+---
+
 ## The Problem
 
 Claude Code's `/remote-control` gives you a URL to connect from anywhere. But:
 - The link expires when the connection drops
 - You have to manually type `/remote-control` again to get a new one
 - If you're away from your terminal, you're locked out
-- RC sometimes shows "connected" but is actually stuck in "connecting" state
+- RC sometimes gets stuck in "reconnecting" state
 
 ## The Solution
 
 ```
-aqua-remote start --session sol:0 --name pilot
+python3 src/cli.py start --session sol:0 --name pilot
 ```
 
-That's it. aqua-remote will:
-1. Detect when RC drops or gets stuck
-2. Auto-recover the connection (disconnect → reconnect)
-3. Send you the new RC link on Telegram/Discord/email
-4. Protect your input — if you're actively using RC from your phone, recovery waits 60s before touching anything
-5. Restart itself if it crashes (via cron watchdog)
+aqua-remote will:
+1. **Detect** when RC drops or gets stuck
+2. **Auto-recover** the connection (clear stale state, send fresh `/remote-control`)
+3. **Send you the new RC link** on Telegram / Discord / email — one message, clickable
+4. **Protect your input** — if you're typing on your phone via RC, recovery waits
+5. **Restart itself** if it crashes (via optional cron watchdog)
 
-## Requirements
+---
 
+## Quick Start
+
+### 1. Requirements
+
+- **Python 3.10+** — no pip dependencies (stdlib only)
 - **tmux** — your Claude Code session must run inside tmux
-- **Python 3.10+** — no pip dependencies needed (stdlib only)
 - **Claude Code** with Remote Control support
 
-### Not using tmux yet?
+### 2. Clone
+
+```bash
+git clone https://github.com/prezis/aqua-remote.git
+cd aqua-remote
+```
+
+### 3. Configure notifications
+
+```bash
+python3 src/setup.py
+```
+
+The setup wizard walks you through choosing and configuring your notification channel.
+
+### 4. Start monitoring
+
+```bash
+python3 src/cli.py start --session sol:0 --name pilot
+```
+
+### 5. Install watchdog (optional)
+
+```bash
+python3 src/cli.py install
+```
+
+Adds a cron job that checks every 5 minutes if your monitor is alive and restarts it if needed.
+
+---
+
+## Notification Channels
+
+### Telegram (recommended)
+
+Best for mobile — instant push notifications with a clickable RC link.
+
+**Step 1: Create a bot**
+
+1. Open Telegram, search for **@BotFather** (or go to [t.me/BotFather](https://t.me/BotFather))
+2. Send `/newbot`
+3. Choose a name (e.g. "RC Monitor") and a username (must end in `bot`)
+4. Copy the **bot token** — looks like `123456789:ABCdefGHIjklMNOpqrSTUvwxYZ`
+
+**Step 2: Create a group and add the bot**
+
+1. Create a new Telegram group (e.g. "RC Alerts")
+2. Add your bot to the group
+3. **Send at least one message** in the group — the bot needs this to detect the chat
+
+Or for direct messages: open a chat with your bot and press "Start".
+
+**Step 3: Get the chat ID**
+
+Open this URL in your browser (replace `YOUR_BOT_TOKEN`):
+
+```
+https://api.telegram.org/botYOUR_BOT_TOKEN/getUpdates
+```
+
+Find `"chat":{"id":` in the JSON:
+- **Group IDs** start with `-` (e.g. `-1001234567890`)
+- **DM IDs** are positive numbers (e.g. `123456789`)
+
+> **Empty response?** Make sure you sent a message *after* adding the bot. Remove and re-add the bot if needed.
+
+**Step 4: Run setup**
+
+```bash
+python3 src/setup.py
+# Choose "1. Telegram"
+# Paste bot token
+# Paste chat ID
+# Check your Telegram for the test message
+```
+
+### Discord
+
+1. **Server Settings → Integrations → Webhooks → New Webhook**
+2. Name it, choose the channel, click **Copy Webhook URL**
+3. Paste into the setup wizard
+
+### Email
+
+Works with Gmail (App Passwords), Outlook, or any SMTP server.
+
+For Gmail: enable 2FA → create an App Password at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
+
+---
+
+## Usage
+
+```bash
+# Start monitoring
+python3 src/cli.py start --session sol:0 --name pilot
+
+# Check status
+python3 src/cli.py status
+
+# Stop monitoring
+python3 src/cli.py stop --name pilot
+
+# Test notifications
+python3 src/cli.py test
+
+# Run in foreground (for debugging)
+python3 src/cli.py start --session sol:0 --name pilot --foreground
+
+# Force restart if already running
+python3 src/cli.py start --session sol:0 --name pilot --force
+
+# Monitor multiple sessions
+python3 src/cli.py start --session sol:0 --name pilot
+python3 src/cli.py start --session work:2 --name backend
+```
+
+---
+
+## How It Works
+
+```
+┌────────────────┐     ┌───────────────┐     ┌────────────────┐
+│  Claude Code   │────>│    monitor    │────>│  Telegram /    │
+│  in tmux       │     │   (Python)    │     │  Discord /     │
+│  sol:0         │<────│               │     │  Email         │
+└────────────────┘     └───────┬───────┘     └────────────────┘
+                               │
+                       ┌───────▼───────┐
+                       │   watchdog    │
+                       │   (cron)      │
+                       │   restarts    │
+                       │   if dead     │
+                       └───────────────┘
+```
+
+1. **Monitor** captures tmux output every 15s, detects RC state and URLs
+2. **Auto-recovery** triggers when RC drops (connected → gone) or enters "reconnecting" state
+3. **User protection** — if you used RC in the last 60s, recovery waits so it doesn't corrupt your input
+4. **Recovery process**: clears stale state → sends `/remote-control` → auto-accepts Continue menu → sends you the new link
+5. **Single notification** — one Telegram message with clickable link (no spam)
+6. **Heartbeat file** every 15s — watchdog cron restarts the monitor if heartbeat goes stale
+
+### What triggers recovery
+
+| Trigger | Description |
+|---------|-------------|
+| RC drop | RC was "connected" but status disappeared |
+| Reconnecting | RC stuck in "reconnecting" state (>10 min) |
+| Idle + no RC | Session idle >2 min and RC not connected |
+
+### What does NOT trigger recovery
+
+| Situation | Why |
+|-----------|-----|
+| Idle + RC connected | Normal — Claude waiting for your input |
+| Pilot busy | RC works even during processing — command queues |
+| User recently active | Waits 60s after last user interaction |
+
+### Recovery during busy sessions
+
+`/remote-control` sent while Claude is busy **queues in the terminal buffer** and executes when the current task finishes. The monitor detects this (sees the command on the prompt line) and waits patiently instead of re-sending.
+
+---
+
+## Not Using tmux Yet?
 
 tmux lets your terminal sessions survive disconnects and run in the background.
 
@@ -51,174 +221,19 @@ claude
 tmux attach -t work
 ```
 
-Quick tmux cheatsheet:
 | Shortcut | Action |
 |----------|--------|
 | `Ctrl+B, C` | New window |
 | `Ctrl+B, N` | Next window |
-| `Ctrl+B, P` | Previous window |
 | `Ctrl+B, D` | Detach (keeps running) |
 | `tmux ls` | List sessions |
 | `tmux attach -t NAME` | Re-attach |
 
-## Setup
-
-### 1. Clone
-
-```bash
-git clone https://github.com/prezis/aqua-remote.git
-cd aqua-remote
-```
-
-### 2. Configure notifications
-
-```bash
-python3 src/setup.py
-```
-
-This interactive wizard walks you through setting up your notification channel. See detailed instructions for each channel below.
-
-### 3. Start monitoring
-
-```bash
-# Monitor a specific tmux window
-python3 src/cli.py start --session sol:0 --name pilot
-
-# Monitor multiple sessions
-python3 src/cli.py start --session sol:0 --name pilot
-python3 src/cli.py start --session work:2 --name backend
-```
-
-### 4. Install watchdog (optional but recommended)
-
-```bash
-python3 src/cli.py install
-```
-
-This adds a cron job that checks every 5 minutes if your monitors are alive and restarts them if they crash (OOM, etc).
-
 ---
 
-## Notification Channels
+## Config & Files
 
-### Telegram (recommended)
-
-Telegram is the best option for mobile — you get instant push notifications with your RC link.
-
-#### Step 1: Create a Telegram Bot
-
-1. Open Telegram and search for **@BotFather** (or go to https://t.me/BotFather)
-2. Send `/newbot`
-3. Choose a name for your bot (e.g. "My Remote Control Bot")
-4. Choose a username (must end in `bot`, e.g. `my_rc_monitor_bot`)
-5. BotFather will give you a **bot token** — copy it. It looks like: `123456789:ABCdefGHIjklMNOpqrSTUvwxYZ`
-
-#### Step 2: Create a Group and Add the Bot
-
-You need a Telegram group (or channel) where the bot will send alerts.
-
-**Option A: Use a group (recommended)**
-1. Create a new Telegram group (hamburger menu → New Group)
-2. Name it something like "RC Alerts"
-3. Add your bot to the group (search for its username)
-4. **Important:** Send at least one message in the group (e.g. "hello") — the bot needs this to detect the chat
-
-**Option B: Use a direct message**
-1. Open a chat with your bot (search for its username)
-2. Press "Start" or send `/start`
-
-#### Step 3: Get the Chat ID
-
-The chat ID tells the bot WHERE to send messages.
-
-1. Open this URL in your browser (replace `YOUR_BOT_TOKEN` with your actual token):
-   ```
-   https://api.telegram.org/botYOUR_BOT_TOKEN/getUpdates
-   ```
-2. Look for `"chat":{"id":` in the JSON response
-   - **Group chat IDs** start with `-` (e.g. `-1001234567890`)
-   - **Direct message IDs** are positive numbers (e.g. `123456789`)
-3. Copy the full number including the minus sign if present
-
-**Troubleshooting:** If the response is empty (`{"ok":true,"result":[]}`):
-- Make sure you sent a message in the group/chat AFTER adding the bot
-- Remove the bot from the group, re-add it, and send another message
-- Try again — the getUpdates endpoint only shows recent messages
-
-#### Step 4: Enter credentials in setup wizard
-
-```bash
-python3 src/setup.py
-# Choose "1. Telegram"
-# Paste your bot token
-# Paste your chat ID
-# The wizard sends a test message — check your Telegram!
-```
-
-### Discord
-
-1. In your Discord server: **Server Settings → Integrations → Webhooks → New Webhook**
-2. Name it (e.g. "aqua-remote"), choose the channel
-3. Click **Copy Webhook URL**
-4. Paste into the setup wizard
-
-### Email
-
-Works with Gmail (App Passwords), Outlook, or any SMTP server.
-- For Gmail: enable 2FA → create an App Password at myaccount.google.com/apppasswords
-- The setup wizard will ask for SMTP host, port, username, password, and recipient address
-
----
-
-## Usage
-
-```bash
-# Check status of all monitors
-python3 src/cli.py status
-
-# Stop a monitor
-python3 src/cli.py stop --name pilot
-
-# Test notifications (sends a test message to your channel)
-python3 src/cli.py test
-
-# Run in foreground (for debugging)
-python3 src/cli.py start --session sol:0 --name pilot --foreground
-
-# Force restart if already running
-python3 src/cli.py start --session sol:0 --name pilot --force
-```
-
-## How It Works
-
-```
-+----------------+     +---------------+     +----------------+
-|  Claude Code   |---->|    monitor    |---->|  Telegram /    |
-|  in tmux       |     |   (Python)    |     |  Discord /     |
-|  sol:0         |<----|               |     |  Email         |
-+----------------+     +-------+-------+     +----------------+
-                                |
-                        +-------v-------+
-                        |   watchdog    |
-                        |   (cron)      |
-                        |   restarts    |
-                        |   if dead     |
-                        +---------------+
-```
-
-1. **Monitor** captures tmux output every 30s, detects RC URLs and connection state
-2. **Auto-recovery** triggers after 15 min idle or when "reconnecting" state is detected
-3. **User protection** — if you used RC in the last 60s (sent a message from your phone), recovery waits so it doesn't corrupt your input
-4. **Recovery process**: clears stale state → sends fresh `/remote-control` → auto-accepts the Continue menu → sends you the new link
-5. **Heartbeat file** written every 30s — watchdog cron restarts the monitor if heartbeat goes stale
-
-> **Note:** Claude Code has no `/disconnect` command. Recovery uses `Ctrl+C` + `Escape` to clear stale "reconnecting" state, then sends a fresh `/remote-control`. The RC menu (Continue/Disconnect) is auto-handled.
-
-> **Note:** Recovery does NOT wait for Claude to finish working. The `/remote-control` command queues in the terminal buffer and executes when the current task completes. This way RC stays available even during long-running operations.
-
-## Config
-
-Config lives in `~/.aqua-remote/config.json`:
+Config: `~/.aqua-remote/config.json` (chmod 600, owner-only)
 
 ```json
 {
@@ -229,37 +244,59 @@ Config lives in `~/.aqua-remote/config.json`:
 ```
 
 Runtime files:
-- Logs: `~/.aqua-remote/logs/`
-- State: `~/.aqua-remote/state/`
-- Heartbeats: `~/.aqua-remote/heartbeats/`
-- PID files: `~/.aqua-remote/pids/`
+
+| Path | Purpose |
+|------|---------|
+| `~/.aqua-remote/logs/` | Monitor logs |
+| `~/.aqua-remote/state/` | Recovery state (last URL, counters) |
+| `~/.aqua-remote/heartbeats/` | Heartbeat timestamps |
+| `~/.aqua-remote/pids/` | PID files |
+
+---
 
 ## FAQ
 
-**Q: Can I monitor multiple sessions?**
-A: Yes. Run `start` for each session with a different `--name`. Each gets its own monitor, heartbeat, and alerts.
+**Can I monitor multiple sessions?**
+Yes. Run `start` with a different `--name` for each. Each gets its own monitor, heartbeat, and alerts.
 
-**Q: What if my machine reboots?**
-A: The cron watchdog will restart monitors, but you need to restart your tmux sessions and Claude Code first. Consider adding startup scripts.
+**What if my machine reboots?**
+The cron watchdog restarts monitors, but you need to restart tmux and Claude Code first.
 
-**Q: Does it work without tmux?**
-A: No. tmux is required because aqua-remote reads session output via `tmux capture-pane`.
+**Does it work without tmux?**
+No. tmux is required — aqua-remote reads output via `tmux capture-pane`.
 
-**Q: Is this safe? Does it send my code/conversations?**
-A: aqua-remote only reads the last 80 lines of tmux output to detect RC URLs and connection state. It never reads, stores, or sends your code or conversation content. The only data sent to your notification channel is: RC links, connection status alerts, and session names.
+**Is this safe? Does it read my code?**
+aqua-remote only reads the last 80 lines of tmux output to detect RC URLs and connection state. It never reads, stores, or sends your code or conversations. Only RC links and status alerts go to your notification channel.
 
-**Q: Where are my credentials stored?**
-A: In `~/.aqua-remote/config.json` with chmod 600 (owner-only read). Do not commit this file — it's in `.gitignore`.
+**Where are my credentials stored?**
+In `~/.aqua-remote/config.json` with chmod 600 (owner-only read). Never commit this file.
 
-**Q: What if I'm typing on my phone and recovery triggers?**
-A: It won't. aqua-remote tracks when you last interacted via RC. If you sent a message in the last 60 seconds, all recovery actions are postponed. After 60s of inactivity, recovery resumes normally.
+**What if I'm typing on my phone and recovery triggers?**
+It won't. aqua-remote tracks when you last interacted via RC. If you were active in the last 60 seconds, recovery waits.
 
-## Security
+**What about the recovery spam I used to get?**
+Fixed. Recovery now sends a single message with the clickable RC link. No more "recovering... reconnected... new link" spam.
 
-- Config file (`~/.aqua-remote/config.json`) stores notification credentials (bot tokens, webhook URLs, SMTP passwords) in **plaintext** with `chmod 600` (owner-only read)
-- Do not commit `config.json` to version control — it is in `.gitignore`
-- The monitor only reads tmux pane output to detect RC URLs and connection state
-- PID files and heartbeats contain only process IDs and timestamps
+---
+
+## Project Structure
+
+```
+aqua-remote/
+├── src/
+│   ├── cli.py        # CLI commands (start/stop/status/test/install/setup)
+│   ├── monitor.py    # Core monitoring loop + recovery logic
+│   ├── notify.py     # Notification channels (Telegram/Discord/Email)
+│   ├── setup.py      # Interactive setup wizard
+│   └── watchdog.sh   # Cron watchdog script
+├── pyproject.toml
+├── LICENSE            # MIT
+└── README.md
+```
+
+Zero external dependencies — stdlib only.
+
+---
 
 ## License
 
