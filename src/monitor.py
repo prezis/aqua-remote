@@ -193,23 +193,15 @@ def is_pilot_busy(content: str) -> bool:
 def is_user_typing(content: str) -> bool:
     """Check if the user appears to be mid-input.
 
-    NOTE: "Type your message" is the PLACEHOLDER shown when input is EMPTY.
-    Its presence means user is NOT typing — safe to send commands.
-    When user types, the placeholder disappears and their text appears instead.
+    Only checks for STRONG indicators of active typing — things that would
+    be corrupted by injecting tmux send-keys. Weak indicators (text after ❯)
+    are intentionally ignored because they could be stale prompt history or
+    a message that was already submitted.
 
     Detects:
-    - "Pasted text" indicator (user just pasted a block)
-    - Prompt line (❯) with text after cursor (user mid-sentence)
-    - "queued messages" — user has pending input queued
+    - "queued messages" — user has pending input waiting to be processed
     """
     tail = "\n".join(content.strip().split("\n")[-5:])
-    # Paste indicator — user just pasted something
-    if "Pasted text" in tail:
-        return True
-    # Prompt with user-typed text after it (not just bare prompt)
-    if re.search(r'❯\s+\S', tail):
-        return True
-    # Queued messages waiting to be processed
     if "queued messages" in tail:
         return True
     return False
