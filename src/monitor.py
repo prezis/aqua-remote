@@ -151,12 +151,19 @@ def find_remote_url(text: str) -> str | None:
 
 
 def detect_rc_state(content: str) -> str:
-    """Detect RC state: 'connected', 'reconnecting', 'unknown'."""
-    if "Remote Control reconnecting" in content:
+    """Detect RC state from the LAST 5 lines of tmux output.
+
+    Only checks the tail to avoid false positives from Claude's own text output
+    (e.g. Claude printing 'reconnecting' as part of a conversation about RC).
+    The real RC status appears in the Claude Code status bar at the bottom.
+    """
+    # Use only last 5 lines — the status bar is always at the bottom
+    tail = "\n".join(content.strip().split("\n")[-5:])
+    if "Remote Control reconnecting" in tail:
         return "reconnecting"
     if re.search(
-        r'Remote Control.*connected|remote session active',
-        content, re.IGNORECASE,
+        r'Remote Control.*connected|Remote Control active|remote session active',
+        tail, re.IGNORECASE,
     ):
         return "connected"
     return "unknown"
