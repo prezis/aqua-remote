@@ -630,10 +630,12 @@ def run_monitor(tmux_target: str, session_name: str):
             elif rc_queued:
                 log.log("RC command queued on prompt — waiting, not re-sending")
 
-            if idle_time > DISCONNECT_THRESHOLD and not disconnect_notified:
+            # Idle timeout recovery — ONLY when RC is NOT connected
+            # When RC is connected and session is idle, that's normal (waiting for user input)
+            if idle_time > DISCONNECT_THRESHOLD and not disconnect_notified and rc_state != "connected":
                 should_recover = True
                 disconnect_notified = True
-                log.log(f"Idle timeout: {int(idle_time)}s", "WARN")
+                log.log(f"Idle timeout: {int(idle_time)}s, rc={rc_state}", "WARN")
 
             # Track RC state transitions
             state["last_rc_state"] = rc_state
