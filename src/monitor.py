@@ -342,10 +342,23 @@ def recover_rc(target: str, log: Logger) -> str | None:
         log.log("User started typing — postponing recovery")
         return None
 
+    # Wait briefly for pilot to be idle (so /remote-control doesn't sit visible
+    # on prompt while Claude is busy). Max 30s wait, then send anyway.
+    for wait_attempt in range(6):
+        if not is_pilot_busy(capture_tmux(target, 10)):
+            break
+        log.log(f"Pilot busy — waiting for idle ({(wait_attempt+1)*5}s/30s)")
+        time.sleep(5)
+
     # Send /remote-control
     log.log("Sending /remote-control...")
     send_tmux(target, "/remote-control")
-    time.sleep(12)
+
+    # Wait for command to execute — longer if pilot was busy (queued)
+    busy_after_send = is_pilot_busy(capture_tmux(target, 5))
+    wait_time = 30 if busy_after_send else 12
+    log.log(f"Waiting {wait_time}s for RC to process (busy={busy_after_send})")
+    time.sleep(wait_time)
 
     # Check for URL
     content = capture_tmux(target, 30)
