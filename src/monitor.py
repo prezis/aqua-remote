@@ -125,18 +125,37 @@ def send_tmux(target: str, keys: str, enter: bool = True):
     subprocess.run(cmd, timeout=5, capture_output=True)
 
 
-def send_tmux_hex(target: str, text: str, enter: bool = True):
+def send_tmux_hex(target: str, text: str, enter: bool = True, slow: bool = False):
     """Send text to tmux pane as hex bytes via -H flag.
 
     Bypasses bracketed paste mode / autocomplete ghost text issues.
     Each character is sent as its hex byte value. If enter=True,
     appends 0x0d (carriage return) to execute the command.
+
+    If slow=True, sends each character individually with a 150ms delay.
+    This avoids ghost text corruption from Claude Code's autocomplete
+    intercepting the input when all bytes arrive at once.
     """
     hex_bytes = [format(b, "02x") for b in text.encode("utf-8")]
-    if enter:
-        hex_bytes.append("0d")  # carriage return = Enter
-    cmd = ["tmux", "send-keys", "-t", target, "-H"] + hex_bytes
-    subprocess.run(cmd, timeout=5, capture_output=True)
+    if slow:
+        # Send each byte individually with delay to avoid ghost text
+        for hb in hex_bytes:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", target, "-H", hb],
+                timeout=5, capture_output=True,
+            )
+            time.sleep(0.15)
+        if enter:
+            time.sleep(0.3)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", target, "-H", "0d"],
+                timeout=5, capture_output=True,
+            )
+    else:
+        if enter:
+            hex_bytes.append("0d")  # carriage return = Enter
+        cmd = ["tmux", "send-keys", "-t", target, "-H"] + hex_bytes
+        subprocess.run(cmd, timeout=5, capture_output=True)
 
 
 def find_remote_url(text: str) -> str | None:
@@ -230,7 +249,8 @@ def is_user_typing(content: str) -> bool:
         match = re.search(r'\u276f\s*(.+)', last_prompt_line)
         if match:
             text_after = match.group(1).strip()
-            if text_after:
+            # /remote-control on prompt = aqua-remote typed it, NOT user
+            if text_after and not re.match(r'^/?remote-control$', text_after):
                 return True
 
     return False
@@ -297,14 +317,49 @@ def _cleanup_bridge_pointers(log: Logger):
             pass
 
 
-def _dismiss_menu_or_prompt(target: str, content: str, log: Logger):
-    """Dismiss RC menu (select Continue) or rating prompts."""
+def _dismiss_menu_or_prompt(target: str, content: str, log: Logger, force_disconnect: bool = False):
+    """Dismiss RC menu (select Continue) or rating prompts.
+
+    If force_disconnect=True AND RC is in "reconnecting" state, select Disconnect
+    instead of Continue to break the reconnecting loop.
+    """
     # RC menu: "Enter to select" with Continue/Disconnect options
-    if re.search(r"Enter to select|Continue.*Disconnect|Disconnect this session", content):
-        # "Continue" is the default (bottom option) — just press Enter
-        log.log("RC menu detected — pressing Enter (Continue)")
-        send_tmux(target, "Enter", enter=False)
-        time.sleep(3)
+    # ONLY check last 5 lines — "Continue" appears in Claude's text output too (false positive!)
+    menu_area = "\n".join(content.strip().split("\n")[-5:])
+    if re.search(r"Enter to select|Continue.*Disconnect|Disconnect this session", menu_area):
+        rc_reconnecting = "Remote Control reconnecting" in menu_area
+        if force_disconnect or rc_reconnecting:
+            # Select Disconnect (top option) — Up Up Enter
+            log.log("RC menu detected — selecting DISCONNECT (reconnecting state)")
+            send_tmux(target, "Up", enter=False)
+            time.sleep(0.3)
+            send_tmux(target, "Up", enter=False)
+            time.sleep(0.3)
+            send_tmux(target, "", enter=True)
+            time.sleep(5)
+            # Clean bridge pointers after disconnect
+            _cleanup_bridge_pointers(log)
+            time.sleep(3)
+            # Now send fresh /remote-control to get new link (slow to avoid ghost text)
+            log.log("Sending fresh /remote-control after disconnect...")
+            send_tmux(target, "Escape", enter=False)
+            time.sleep(0.5)
+            send_tmux(target, "C-u", enter=False)
+            time.sleep(1)
+            send_tmux_hex(target, "/remote-control", enter=True, slow=True)
+            time.sleep(8)
+            # Check for new menu (Continue on fresh connection) and accept it
+            fresh_content = capture_tmux(target, 20)
+            fresh_tail = "\n".join(fresh_content.strip().split("\n")[-5:])
+            if re.search(r"Enter to select|Continue.*Disconnect", fresh_tail):
+                log.log("Fresh RC menu — pressing Enter (Continue)")
+                send_tmux(target, "", enter=True)
+                time.sleep(3)
+        else:
+            # Normal case: "Continue" is the default — just press Enter
+            log.log("RC menu detected — pressing Enter (Continue)")
+            send_tmux(target, "", enter=True)
+            time.sleep(3)
         return True
 
     # Rating prompt: "How is Claude doing"
@@ -323,14 +378,128 @@ def _dismiss_menu_or_prompt(target: str, content: str, log: Logger):
     return False
 
 
-def recover_rc(target: str, log: Logger) -> str | None:
+def recover_rc_hard(target: str, log: Logger) -> str | None:
+    """Hard RC reset: disconnect via menu, wait, then fresh /remote-control.
+
+    Used when soft recovery (Ctrl+C + Escape) fails repeatedly for "reconnecting".
+    Strategy:
+    1. Send /remote-control to get the menu
+    2. Navigate UP to "Disconnect this session" and press Enter
+    3. Wait for disconnect to complete
+    4. Clean bridge pointers
+    5. Send fresh /remote-control
+    """
+    log.log("=== HARD RC RESET ===")
+
+    # Step 1: Clean bridge pointers first
+    _cleanup_bridge_pointers(log)
+
+    # Step 2: Try Ctrl+C to cancel any pending operation
+    send_tmux(target, "C-c", enter=False)
+    time.sleep(2)
+    send_tmux(target, "Escape", enter=False)
+    time.sleep(2)
+
+    # Step 3: Send /remote-control to get the menu (slow mode avoids ghost text)
+    send_tmux(target, "Escape", enter=False)
+    time.sleep(0.5)
+    send_tmux(target, "C-u", enter=False)
+    time.sleep(1)
+    send_tmux_hex(target, "/remote-control", enter=True, slow=True)
+    log.log("Hard reset: sent /remote-control for disconnect menu (slow)")
+
+    # Step 4: Wait for menu to appear (max 30s)
+    menu_found = False
+    for i in range(6):
+        time.sleep(5)
+        menu_content = capture_tmux(target, 20)
+        menu_tail_hard = "\n".join(menu_content.strip().split("\n")[-5:])
+        if re.search(r"Enter to select|Continue.*Disconnect|Disconnect this session", menu_tail_hard):
+            menu_found = True
+            break
+        # URL appeared directly (no menu) — RC might have reconnected
+        if find_remote_url(menu_content):
+            log.log("Hard reset: URL appeared without menu — RC may have self-recovered")
+            return find_remote_url(menu_content)
+
+    if menu_found:
+        # Step 5: Navigate to "Disconnect this session" — it's the top option, use Up arrow
+        log.log("Hard reset: RC menu found — selecting Disconnect (Up + Enter)")
+        send_tmux(target, "Up", enter=False)
+        time.sleep(0.5)
+        send_tmux(target, "Up", enter=False)
+        time.sleep(0.5)
+        send_tmux(target, "", enter=True)  # Enter to confirm Disconnect
+        time.sleep(5)
+
+        # Check if disconnect worked
+        dc_content = capture_tmux(target, 10)
+        if "reconnecting" not in dc_content.lower():
+            log.log("Hard reset: Disconnect successful")
+        else:
+            log.log("Hard reset: Still reconnecting after disconnect attempt", "WARN")
+            # Try once more: Ctrl+C aggressively
+            send_tmux(target, "C-c", enter=False)
+            time.sleep(3)
+            send_tmux(target, "C-c", enter=False)
+            time.sleep(5)
+    else:
+        log.log("Hard reset: No RC menu appeared — trying Ctrl+C x2 + bridge cleanup", "WARN")
+        send_tmux(target, "C-c", enter=False)
+        time.sleep(2)
+        send_tmux(target, "C-c", enter=False)
+        time.sleep(5)
+        _cleanup_bridge_pointers(log)
+        time.sleep(5)
+
+    # Step 6: Wait for session to stabilize
+    log.log("Hard reset: Waiting 10s for session to stabilize...")
+    time.sleep(10)
+
+    # Step 7: Send fresh /remote-control (slow mode to avoid ghost text)
+    send_tmux(target, "Escape", enter=False)
+    time.sleep(0.5)
+    send_tmux(target, "C-u", enter=False)
+    time.sleep(1)
+    send_tmux_hex(target, "/remote-control", enter=True, slow=True)
+    log.log("Hard reset: Sent fresh /remote-control (slow)")
+
+    # Step 8: Wait for URL or menu (max 60s)
+    for poll in range(12):
+        time.sleep(5)
+        poll_content = capture_tmux(target, 30)
+        if _dismiss_menu_or_prompt(target, poll_content, log):
+            time.sleep(3)
+            break
+        url = find_remote_url(poll_content)
+        if url:
+            log.log(f"Hard reset: RC URL found: {url[:60]}...")
+            return url
+        if "Remote Control active" in poll_content:
+            break
+
+    # Final URL check
+    content = capture_tmux(target, 30)
+    url = find_remote_url(content)
+    _dismiss_menu_or_prompt(target, content, log)
+
+    if url:
+        log.log(f"Hard reset: SUCCESS — {url[:60]}...")
+    else:
+        log.log("Hard reset: FAILED — no URL found", "ERROR")
+
+    return url
+
+
+def recover_rc(target: str, log: Logger, hard: bool = False) -> str | None:
     """Attempt to recover RC link. Returns URL or None.
 
     Recovery strategy:
-    1. If "reconnecting" → Ctrl+C + Escape + bridge cleanup → fresh /remote-control
-    2. If stuck on menu → dismiss (Enter for Continue)
-    3. Send /remote-control → wait for URL → auto-accept Continue menu
-    4. Verify session resumed
+    1. If hard=True → use recover_rc_hard() (disconnect + reconnect)
+    2. If "reconnecting" → Ctrl+C + Escape + bridge cleanup → fresh /remote-control
+    3. If stuck on menu → dismiss (Enter for Continue)
+    4. Send /remote-control → wait for URL → auto-accept Continue menu
+    5. Verify session resumed
     """
     content = capture_tmux(target, 30)
 
@@ -345,25 +514,49 @@ def recover_rc(target: str, log: Logger) -> str | None:
         log.log("User appears to be typing — postponing recovery")
         return None
 
-    # If reconnecting, clear stale state first
-    # NOTE: Claude Code has NO /disconnect command — use Ctrl+C + Escape instead
+    # Hard reset path — for persistent reconnecting failures
+    if hard:
+        return recover_rc_hard(target, log)
+
+    # If reconnecting, use disconnect+reconnect strategy (Ctrl+C alone doesn't work!)
     if "reconnecting" in detect_rc_state(content):
-        log.log("RC reconnecting — clearing stale state with Ctrl+C + bridge cleanup")
-        # Re-check user typing before sending keys
+        log.log("RC reconnecting — using disconnect+reconnect strategy")
         if is_user_typing(capture_tmux(target, 10)):
             log.log("User typing detected before clearing — postponing")
             return None
-        # Clean up stale bridge pointer files
         _cleanup_bridge_pointers(log)
-        # Cancel reconnecting with Ctrl+C then Escape
-        send_tmux(target, "C-c", enter=False)
-        time.sleep(3)
+        # Send /remote-control to get menu with Disconnect option (slow to avoid ghost text)
         send_tmux(target, "Escape", enter=False)
-        time.sleep(3)
-        content = capture_tmux(target, 10)
-        if "reconnecting" in content.lower():
-            log.log("Still reconnecting after Ctrl+C — waiting longer")
-            time.sleep(10)
+        time.sleep(0.5)
+        send_tmux(target, "C-u", enter=False)
+        time.sleep(1)
+        send_tmux_hex(target, "/remote-control", enter=True, slow=True)
+        log.log("Sent /remote-control to get disconnect menu (slow)")
+        menu_found = False
+        for i in range(6):
+            time.sleep(5)
+            menu_content = capture_tmux(target, 20)
+            menu_tail = "\n".join(menu_content.strip().split("\n")[-5:])
+            if re.search(r"Enter to select|Continue.*Disconnect|Disconnect this session", menu_tail):
+                menu_found = True
+                break
+        if menu_found:
+            log.log("RC menu found — selecting Disconnect (Up+Up+Enter)")
+            send_tmux(target, "Up", enter=False)
+            time.sleep(0.3)
+            send_tmux(target, "Up", enter=False)
+            time.sleep(0.3)
+            send_tmux(target, "", enter=True)
+            time.sleep(5)
+            _cleanup_bridge_pointers(log)
+            log.log("Disconnected — waiting 5s before fresh /remote-control")
+            time.sleep(5)
+        else:
+            log.log("No menu appeared — Ctrl+C fallback", "WARN")
+            send_tmux(target, "C-c", enter=False)
+            time.sleep(3)
+            send_tmux(target, "Escape", enter=False)
+            time.sleep(5)
 
     # If stuck on an old RC menu or rating prompt, dismiss it
     content = capture_tmux(target, 10)
@@ -385,13 +578,13 @@ def recover_rc(target: str, log: Logger) -> str | None:
         log.log(f"Pilot busy — waiting for idle ({(wait_attempt+1)*5}s/15s)")
         time.sleep(5)
 
-    # Send /remote-control using hex bytes to bypass bracketed paste / ghost text
-    log.log("Sending /remote-control (hex mode)...")
+    # Send /remote-control using slow hex bytes to bypass ghost text corruption
+    log.log("Sending /remote-control (slow hex mode)...")
     send_tmux(target, "Escape", enter=False)  # clear any autocomplete state
     time.sleep(0.5)
     send_tmux(target, "C-u", enter=False)     # clear current line
-    time.sleep(0.5)
-    send_tmux_hex(target, "/remote-control", enter=True)
+    time.sleep(1)
+    send_tmux_hex(target, "/remote-control", enter=True, slow=True)
 
     # Poll for RC URL or menu (max 90s) — handles both immediate and queued execution
     log.log("Waiting for RC to process...")
@@ -456,8 +649,9 @@ def recover_rc(target: str, log: Logger) -> str | None:
             log.log(f"Session active after {(attempt + 1) * 5}s")
             break
 
-        # Still on menu? Keep pressing Enter
-        if re.search(r"Enter to select|Continue|Disconnect", check):
+        # Still on menu? Keep pressing Enter (only check last 5 lines)
+        check_tail = "\n".join(check.strip().split("\n")[-5:])
+        if re.search(r"Enter to select|Continue.*Disconnect|Disconnect this session", check_tail):
             log.log("Still on RC menu — pressing Enter")
             send_tmux(target, "Enter", enter=False)
 
@@ -481,7 +675,11 @@ def load_state(session_name: str) -> dict:
             return json.loads(state_file.read_text())
     except Exception:
         pass
-    return {"last_url": "", "last_recovery_ts": 0, "recovery_count_today": 0, "last_date": ""}
+    return {
+        "last_url": "", "last_recovery_ts": 0, "recovery_count_today": 0,
+        "last_date": "", "consecutive_reconnecting_fails": 0,
+        "limit_reached_notified": False,
+    }
 
 
 def save_state(session_name: str, state: dict):
@@ -625,6 +823,7 @@ def run_monitor(tmux_target: str, session_name: str):
             if state.get("last_date") != today:
                 state["recovery_count_today"] = 0
                 state["last_date"] = today
+                state["limit_reached_notified"] = False
                 save_state(session_name, state)
 
             # Detect meaningful change
@@ -641,15 +840,19 @@ def run_monitor(tmux_target: str, session_name: str):
                     log.log("Activity resumed")
             last_content = content
 
-            # Dismiss any blocking menu/prompt ASAP — these halt the session
-            if _dismiss_menu_or_prompt(tmux_target, content, log):
+            # Detect RC state first (needed for menu dismiss logic)
+            rc_state = detect_rc_state(content)
+
+            # Dismiss any blocking menu/prompt ASAP — but NEVER when user is typing
+            if is_user_typing(content):
+                pass  # User is mid-input — don't send any keys
+            elif _dismiss_menu_or_prompt(tmux_target, content, log,
+                                          force_disconnect=(rc_state == "reconnecting")):
                 # Re-capture after dismiss to get clean state
                 time.sleep(3)
                 content = capture_tmux(tmux_target, 80)
                 last_change_ts = now  # reset idle timer after dismiss
-
-            # Detect RC state and URL
-            rc_state = detect_rc_state(content)
+                rc_state = detect_rc_state(content)
             url = find_remote_url(content)
             if url and url != state.get("last_url"):
                 state["last_url"] = url
@@ -671,7 +874,10 @@ def run_monitor(tmux_target: str, session_name: str):
             # Clear needs_recovery when RC comes back
             if rc_state == "connected" and needs_recovery:
                 needs_recovery = False
-                log.log("RC is back — clearing needs_recovery flag")
+                state["consecutive_reconnecting_fails"] = 0
+                state["limit_reached_notified"] = False
+                save_state(session_name, state)
+                log.log("RC is back — clearing needs_recovery + reconnecting fail counter")
 
             # Check for queued /remote-control on prompt (last 3 lines only)
             prompt_area = "\n".join(content.strip().split("\n")[-3:])
@@ -706,23 +912,65 @@ def run_monitor(tmux_target: str, session_name: str):
             # Recovery
             if should_recover and not recovery_in_progress:
                 time_since_last = now - state.get("last_recovery_ts", 0)
+                consec_recon_fails = state.get("consecutive_reconnecting_fails", 0)
+
                 if time_since_last < RECOVERY_BACKOFF:
                     log.log(f"Backoff: {int(time_since_last)}s since last recovery")
                 elif state.get("recovery_count_today", 0) >= MAX_RECOVERIES_PER_DAY:
-                    log.log("Daily recovery limit reached", "ERROR")
-                    channel.send(
-                        f"aqua-remote: {session_name} — LIMIT REACHED",
-                        f"Session <code>{tmux_target}</code> hit {MAX_RECOVERIES_PER_DAY} "
-                        f"recoveries today. Check manually.",
-                    )
+                    # Daily limit reached — but if RC is STILL reconnecting, do ONE hard reset
+                    if rc_state == "reconnecting" and not state.get("limit_reached_notified"):
+                        state["limit_reached_notified"] = True
+                        save_state(session_name, state)
+                        log.log("Daily limit reached but RC still reconnecting — trying HARD RESET", "WARN")
+                        channel.send(
+                            f"aqua-remote: {session_name} — LIMIT REACHED, trying hard reset",
+                            f"Session <code>{tmux_target}</code> hit {MAX_RECOVERIES_PER_DAY} "
+                            f"recoveries today. Attempting one hard disconnect+reconnect.",
+                        )
+                        recovery_in_progress = True
+                        new_url = recover_rc(tmux_target, log, hard=True)
+                        recovery_in_progress = False
+                        state["last_recovery_ts"] = now
+                        if new_url and new_url != "SKIP_USER_ACTIVE":
+                            state["last_url"] = new_url
+                            state["consecutive_reconnecting_fails"] = 0
+                            state["limit_reached_notified"] = False
+                            save_state(session_name, state)
+                            channel.send(
+                                f"aqua-remote: {session_name} — HARD RESET SUCCESS",
+                                f"<code>{new_url}</code>\n\nRC recovered after hard reset!",
+                            )
+                        else:
+                            save_state(session_name, state)
+                            channel.send(
+                                f"aqua-remote: {session_name} — HARD RESET FAILED",
+                                f"Session <code>{tmux_target}</code> needs manual intervention.",
+                            )
+                    # Don't spam — only log once per 5 minutes when limit is reached
+                    elif not state.get("limit_reached_notified"):
+                        state["limit_reached_notified"] = True
+                        save_state(session_name, state)
+                        log.log("Daily recovery limit reached", "ERROR")
+                        channel.send(
+                            f"aqua-remote: {session_name} — LIMIT REACHED",
+                            f"Session <code>{tmux_target}</code> hit {MAX_RECOVERIES_PER_DAY} "
+                            f"recoveries today. Check manually.",
+                        )
+                    # else: already notified, stay silent
                 # NOTE: pilot busy does NOT block recovery — RC must always work
                 elif is_user_typing(content):
                     log.log("User typing — postponing recovery")
                 else:
                     count = state.get("recovery_count_today", 0) + 1
-                    log.log(f"Starting recovery #{count} (idle={int(idle_time)}s, rc={rc_state})")
+                    # Decide soft vs hard recovery based on consecutive failures
+                    use_hard = (
+                        rc_state == "reconnecting"
+                        and consec_recon_fails >= 3
+                    )
+                    mode = "HARD" if use_hard else "soft"
+                    log.log(f"Starting {mode} recovery #{count} (idle={int(idle_time)}s, rc={rc_state}, consec_recon_fails={consec_recon_fails})")
                     recovery_in_progress = True
-                    new_url = recover_rc(tmux_target, log)
+                    new_url = recover_rc(tmux_target, log, hard=use_hard)
                     recovery_in_progress = False
 
                     if new_url == "SKIP_USER_ACTIVE":
@@ -734,20 +982,23 @@ def run_monitor(tmux_target: str, session_name: str):
                         state["recovery_count_today"] = count
                         if new_url:
                             state["last_url"] = new_url
+                            state["consecutive_reconnecting_fails"] = 0
+                        elif rc_state == "reconnecting":
+                            state["consecutive_reconnecting_fails"] = consec_recon_fails + 1
                         save_state(session_name, state)
                         # Single notification with result + link (no spam)
                         if new_url:
                             channel.send(
-                                f"aqua-remote: {session_name} — RC recovered",
+                                f"aqua-remote: {session_name} — RC recovered ({mode})",
                                 f"<code>{new_url}</code>\n\n"
                                 f"Click to connect. (recovery #{count})",
                             )
                         else:
                             channel.send(
-                                f"aqua-remote: {session_name} — recovery failed",
+                                f"aqua-remote: {session_name} — recovery failed ({mode})",
                                 f"Session <code>{tmux_target}</code> recovery #{count} "
                                 f"did not produce a new RC link.\n"
-                                f"RC state: {rc_state}",
+                                f"RC state: {rc_state}, consecutive_fails: {consec_recon_fails + 1}",
                             )
 
             # Heartbeat
