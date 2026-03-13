@@ -50,10 +50,10 @@ from notify import create_channel, load_config, NotifyChannel
 # ---------------------------------------------------------------------------
 
 CHECK_INTERVAL = 15  # seconds between checks
-DISCONNECT_THRESHOLD = 120  # 2 min idle = trigger recovery
+DISCONNECT_THRESHOLD = 900  # 15 min idle = trigger recovery
 HEARTBEAT_INTERVAL = 1800  # 30 min between logged heartbeats
 MAX_RECOVERIES_PER_DAY = 30
-RECOVERY_BACKOFF = 60  # 1 min between recovery attempts
+RECOVERY_BACKOFF = 900  # 15 min between recovery attempts
 
 LOG_DIR = Path.home() / ".aqua-remote" / "logs"
 STATE_DIR = Path.home() / ".aqua-remote" / "state"
@@ -207,17 +207,32 @@ def is_pilot_busy(content: str) -> bool:
 def is_user_typing(content: str) -> bool:
     """Check if the user appears to be mid-input.
 
-    Only checks for STRONG indicators of active typing — things that would
-    be corrupted by injecting tmux send-keys. Weak indicators (text after ❯)
-    are intentionally ignored because they could be stale prompt history or
-    a message that was already submitted.
-
     Detects:
     - "queued messages" — user has pending input waiting to be processed
+    - Text after the last ❯ prompt — user is typing a command/prompt
+      (only checks the LAST line containing ❯ to avoid stale prompt matches)
     """
-    tail = "\n".join(content.strip().split("\n")[-5:])
+    tail_lines = content.strip().split("\n")[-5:]
+    tail = "\n".join(tail_lines)
     if "queued messages" in tail:
         return True
+
+    # Check if user has text after the LAST ❯ prompt (means they're mid-input)
+    # Only look at last 3 lines, and only the LAST line that has ❯
+    last_3 = content.strip().split("\n")[-3:]
+    last_prompt_line = None
+    for line in reversed(last_3):
+        if "\u276f" in line:  # ❯ character
+            last_prompt_line = line
+            break
+    if last_prompt_line:
+        # Extract text after ❯ — if non-empty and not just whitespace, user is typing
+        match = re.search(r'\u276f\s*(.+)', last_prompt_line)
+        if match:
+            text_after = match.group(1).strip()
+            if text_after:
+                return True
+
     return False
 
 
@@ -293,10 +308,16 @@ def _dismiss_menu_or_prompt(target: str, content: str, log: Logger):
         return True
 
     # Rating prompt: "How is Claude doing"
-    if re.search(r"How is Claude doing", content):
-        log.log("Rating prompt detected — dismissing")
-        send_tmux(target, "0")
+    # Only check LAST 5 lines to avoid matching old scrollback text
+    last_lines = "\n".join(content.strip().split("\n")[-5:])
+    if re.search(r"How is Claude doing", last_lines):
+        last_dismiss = getattr(_dismiss_menu_or_prompt, '_last_rating_dismiss', 0)
+        if time.time() - last_dismiss < 120:
+            return False  # cooldown active, skip
+        log.log("Rating prompt detected (last 5 lines) — pressing Escape")
+        send_tmux(target, "Escape", enter=False)
         time.sleep(2)
+        _dismiss_menu_or_prompt._last_rating_dismiss = time.time()
         return True
 
     return False
