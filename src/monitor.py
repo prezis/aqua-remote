@@ -49,7 +49,7 @@ from notify import create_channel, load_config, NotifyChannel
 # Config
 # ---------------------------------------------------------------------------
 
-CHECK_INTERVAL = 15  # seconds between checks
+CHECK_INTERVAL = 900  # 15 min between checks
 DISCONNECT_THRESHOLD = 900  # 15 min idle = trigger recovery
 HEARTBEAT_INTERVAL = 1800  # 30 min between logged heartbeats
 MAX_RECOVERIES_PER_DAY = 30
