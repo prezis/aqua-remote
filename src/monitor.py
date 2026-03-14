@@ -207,19 +207,36 @@ def is_pilot_busy(content: str) -> bool:
     """Check if the session is actively working.
 
     Detects:
-    - "esc to interrupt" — universal indicator of active Claude processing
+    - "esc to interrupt" — but ONLY when it's NOT on the status bar line.
+      The status bar always shows "esc to interrupt" even when idle.
+      When Claude is actively processing, it appears on a separate line
+      WITHOUT "Remote Control" or model info on the same line.
     - Braille spinner characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏) at start of line
-    - Common activity words as fallback
+    - "Misting/Whirring/Cooked" — Claude processing indicators
     """
-    tail = "\n".join(content.strip().split("\n")[-5:])
-    # Universal: "esc to interrupt" shown during all active processing
-    if "esc to interrupt" in tail:
-        return True
+    lines = content.strip().split("\n")
+    tail = "\n".join(lines[-5:])
+
+    # Check "esc to interrupt" — but exclude the status bar line.
+    # Status bar has "esc to interrupt" + other info (RC state, model, time)
+    # on the SAME line. Active processing shows it alone or with just a spinner.
+    for line in lines[-5:]:
+        stripped = line.strip()
+        if "esc to interrupt" in stripped:
+            # Status bar line contains RC info, model name, or timestamps
+            is_status_bar = bool(re.search(
+                r'Remote Control|claude|model|gemini|\d{2}:\d{2}|\d{2}-\w{3}-\d{2}',
+                stripped, re.IGNORECASE,
+            ))
+            if not is_status_bar:
+                return True
+            # else: it's just the status bar — not busy
+
     # Braille spinner characters at start of any line
     if re.search(r'^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]', tail, re.MULTILINE):
         return True
-    # Fallback: common processing indicators
-    if re.search(r"Running|thinking|Working", tail, re.IGNORECASE):
+    # Active processing indicators (shown during tool execution)
+    if re.search(r'Misting|Whirring|Cooked for', tail):
         return True
     return False
 
@@ -392,6 +409,19 @@ def recover_rc_hard(target: str, log: Logger) -> str | None:
     """
     log.log("=== HARD RC RESET ===")
 
+    # Step 0: Wait for pilot to be idle before sending any keys.
+    # If pilot is busy (processing), /remote-control goes into input buffer
+    # as text instead of being executed as CLI command.
+    for idle_wait in range(12):  # max 60s
+        idle_check = capture_tmux(target, 10)
+        if not is_pilot_busy(idle_check):
+            break
+        if idle_wait == 0:
+            log.log("Waiting for pilot idle before hard reset...")
+        time.sleep(5)
+    else:
+        log.log("Pilot still busy after 60s — proceeding anyway", "WARN")
+
     # Step 1: Clean bridge pointers first
     _cleanup_bridge_pointers(log)
 
@@ -525,6 +555,13 @@ def recover_rc(target: str, log: Logger, hard: bool = False) -> str | None:
         if is_user_typing(capture_tmux(target, 10)):
             log.log("User typing detected before clearing — postponing")
             return None
+        # Wait for pilot idle before sending keys
+        for _iw in range(12):  # max 60s
+            if not is_pilot_busy(capture_tmux(target, 10)):
+                break
+            if _iw == 0:
+                log.log("Waiting for pilot idle before disconnect...")
+            time.sleep(5)
         _cleanup_bridge_pointers(log)
         # Send /remote-control to get menu with Disconnect option (slow to avoid ghost text)
         send_tmux(target, "Escape", enter=False)
@@ -898,6 +935,30 @@ def run_monitor(tmux_target: str, session_name: str):
                 f"Click to connect.",
             )
             log.log(f"Startup RC URL: {startup_url[:60]}...")
+        # If RC is reconnecting on startup, trigger immediate hard recovery
+        startup_rc = detect_rc_state(startup_content)
+        if startup_rc == "reconnecting":
+            log.log("RC reconnecting on startup — triggering immediate hard recovery")
+            needs_recovery = True
+            new_url = recover_rc(tmux_target, log, hard=True)
+            if new_url and new_url != "SKIP_USER_ACTIVE":
+                state["last_url"] = new_url
+                state["last_recovery_ts"] = time.time()
+                state["consecutive_reconnecting_fails"] = 0
+                count = state.get("recovery_count_today", 0) + 1
+                state["recovery_count_today"] = count
+                save_state(session_name, state)
+                channel.send(
+                    f"aqua-remote: {session_name} — RC recovered (startup hard reset)",
+                    f"<code>{new_url}</code>\n\nClick to connect.",
+                )
+                log.log(f"Startup recovery SUCCESS: {new_url[:60]}...")
+                needs_recovery = False
+            else:
+                state["last_recovery_ts"] = time.time()
+                state["recovery_count_today"] = state.get("recovery_count_today", 0) + 1
+                save_state(session_name, state)
+                log.log("Startup recovery did not produce URL — will retry in main loop", "WARN")
 
     while True:
         try:
@@ -1052,11 +1113,10 @@ def run_monitor(tmux_target: str, session_name: str):
                     log.log("User typing — postponing recovery")
                 else:
                     count = state.get("recovery_count_today", 0) + 1
-                    # Decide soft vs hard recovery based on consecutive failures
-                    use_hard = (
-                        rc_state == "reconnecting"
-                        and consec_recon_fails >= 3
-                    )
+                    # If RC is stuck reconnecting, ALWAYS use hard recovery
+                    # (disconnect first, then fresh connect). Soft recovery
+                    # doesn't work for reconnecting — learned the hard way.
+                    use_hard = (rc_state == "reconnecting")
                     mode = "HARD" if use_hard else "soft"
                     log.log(f"Starting {mode} recovery #{count} (idle={int(idle_time)}s, rc={rc_state}, consec_recon_fails={consec_recon_fails})")
                     recovery_in_progress = True
