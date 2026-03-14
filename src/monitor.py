@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import fcntl
 import json
 import os
 import re
@@ -711,8 +712,92 @@ def check_heartbeat(session_name: str, max_age: int = 300) -> bool:
 # Main loop
 # ---------------------------------------------------------------------------
 
+def _acquire_singleton_lock(session_name: str) -> int:
+    """Acquire an exclusive flock on the lock file. Dies if another instance holds it.
+
+    This is the ONLY reliable way to prevent duplicate monitors. PID files can
+    go stale; pgrep can race. flock is atomic and kernel-enforced.
+
+    Strategy:
+    1. Try flock(LOCK_NB) — if it succeeds, we're the only one.
+    2. If flock fails, another monitor holds it → exit immediately.
+    3. After acquiring lock, kill any orphan processes (zombies without lock).
+
+    Returns the lock fd (must be kept open for the lifetime of the process).
+    """
+    _ensure_dirs()
+    lock_path = PID_DIR / f"{session_name}.lock"
+
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # Another instance holds the lock — exit immediately
+        print(f"FATAL: Another monitor for '{session_name}' is already running (lock held). Exiting.")
+        os.close(fd)
+        sys.exit(1)
+
+    # Lock acquired — we're the singleton. Kill any orphan processes
+    # (e.g. monitors started before flock was introduced, or zombies).
+    _kill_existing_monitors(session_name)
+
+    # Write our PID into the lock file for diagnostics
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
+
+
+def _kill_existing_monitors(session_name: str):
+    """Kill any other monitor.py processes for this session name via pgrep.
+
+    Prevents accumulation of orphan monitors that were started without
+    going through the CLI (e.g. by Claude Code spawning subprocesses).
+    """
+    my_pid = os.getpid()
+    my_ppid = os.getppid()
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"monitor.py.*--name {session_name}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if not result.stdout.strip():
+            return
+        pids_to_kill = []
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                pid = int(line)
+            except ValueError:
+                continue
+            # Never kill ourselves or our parent
+            if pid in (my_pid, my_ppid):
+                continue
+            pids_to_kill.append(pid)
+
+        if not pids_to_kill:
+            return
+
+        for pid in pids_to_kill:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        time.sleep(2)
+        # Force-kill survivors
+        for pid in pids_to_kill:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    except Exception:
+        pass
+
+
 def _write_pid_file(session_name: str) -> Path:
-    """Write PID file and register cleanup."""
+    """Write PID file for status/stop commands."""
     pid_file = PID_DIR / f"{session_name}.pid"
     pid_file.write_text(str(os.getpid()))
     return pid_file
@@ -749,11 +834,16 @@ def read_pid_file(session_name: str) -> int | None:
 def run_monitor(tmux_target: str, session_name: str):
     """Main monitoring loop."""
     _ensure_dirs()
+
+    # SINGLETON: acquire exclusive flock BEFORE anything else.
+    # If another monitor is running, this exits immediately.
+    lock_fd = _acquire_singleton_lock(session_name)
+
     log = Logger(session_name)
     channel = create_channel()
     state = load_state(session_name)
 
-    # Write PID file
+    # Write PID file (for status/stop commands)
     pid_file = _write_pid_file(session_name)
     atexit.register(_remove_pid_file, session_name)
 
