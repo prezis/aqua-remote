@@ -140,6 +140,13 @@ def cmd_start(args):
                 ["tmux", "send-keys", "-t", target, "/remote-control", "Enter"],
                 timeout=5,
             )
+            # Wait for RC to activate, then dismiss any leftover autocomplete/menu
+            time.sleep(12)
+            # Escape closes autocomplete menu, Ctrl-U clears the input line
+            subprocess.run(["tmux", "send-keys", "-t", target, "Escape"], timeout=3)
+            time.sleep(0.5)
+            subprocess.run(["tmux", "send-keys", "-t", target, "C-u"], timeout=3)
+            print("RC activated, prompt cleaned.")
 
 
 def cmd_stop(args):
