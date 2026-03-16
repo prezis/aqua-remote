@@ -50,7 +50,7 @@ from notify import create_channel, load_config, NotifyChannel
 # Config
 # ---------------------------------------------------------------------------
 
-CHECK_INTERVAL = 900  # 15 min between checks
+CHECK_INTERVAL = 30  # 30s between checks (was 900s — caused watchdog to kill us)
 DISCONNECT_THRESHOLD = 900  # 15 min idle = trigger recovery
 HEARTBEAT_INTERVAL = 1800  # 30 min between logged heartbeats
 MAX_RECOVERIES_PER_DAY = 30
@@ -892,12 +892,8 @@ def run_monitor(tmux_target: str, session_name: str):
             f"Monitor for <code>{tmux_target}</code> received SIGTERM.",
         )
         _remove_pid_file(session_name)
-        # Remove heartbeat so watchdog knows we're gone intentionally
-        hb_file = HEARTBEAT_DIR / session_name
-        try:
-            hb_file.unlink(missing_ok=True)
-        except Exception:
-            pass
+        # Do NOT delete heartbeat — watchdog will see it's stale and restart us
+        # Deleting it caused immediate "ZDECHŁ" alert + restart loop
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
@@ -962,6 +958,10 @@ def run_monitor(tmux_target: str, session_name: str):
 
     while True:
         try:
+            # Write heartbeat FIRST — so watchdog knows we're alive
+            # even if the rest of the loop takes time
+            write_heartbeat(session_name)
+
             content = capture_tmux(tmux_target, 80)
             if not content:
                 time.sleep(CHECK_INTERVAL)
