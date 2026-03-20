@@ -48,6 +48,22 @@ def cmd_start(args):
         sys.exit(1)
 
     target = args.session
+    # Auto-detect current tmux window if --session not provided
+    if target is None:
+        try:
+            result = subprocess.run(
+                ["tmux", "display-message", "-p", "#{session_name}:#{window_index}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                target = result.stdout.strip()
+                print(f"Auto-detected tmux window: {target}")
+            else:
+                print("ERROR: Could not auto-detect tmux window. Use --session sol:0")
+                sys.exit(1)
+        except Exception:
+            print("ERROR: Not running in tmux? Use --session sol:0")
+            sys.exit(1)
     name = args.name or target.replace(":", "-")
 
     # Verify tmux target exists
@@ -296,7 +312,7 @@ def main():
 
     # start
     p_start = subs.add_parser("start", help="Start monitoring a session")
-    p_start.add_argument("--session", "-s", required=True, help="Tmux target (e.g. sol:0)")
+    p_start.add_argument("--session", "-s", default=None, help="Tmux target (e.g. sol:0). Auto-detects current tmux window if omitted.")
     p_start.add_argument("--name", "-n", default="", help="Session name (e.g. pilot)")
     p_start.add_argument("--force", "-f", action="store_true", help="Restart if already running")
     p_start.add_argument("--foreground", action="store_true", help="Run in foreground")
